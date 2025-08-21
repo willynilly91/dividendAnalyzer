@@ -5,7 +5,7 @@ Purpose:
   Shared, fetch-free helpers used across the project:
     - Ticker hygiene (prefix stripping, dot→dash, default .TO, de-dup, sort)
     - Name-based country validation (CA vs US by suffix hint)
-    - Small CSV read/write helpers for current & historical tables
+    - CSV helpers for historical (ex-div events) & daily snapshots
     - Historical pruning: keep at most N days (default ~5 years)
 
 Run cadence:
@@ -78,57 +78,65 @@ def validate_tickers(symbols: List[str], expected_country: str):
             mismatched.append((s, guess))
     return valid, mismatched
 
-# ---------- CSV I/O ----------
-def write_current_snapshot(rows: Iterable[Dict], out_path: str) -> None:
-    df = pd.DataFrame(list(rows))
-    # Decide which column set we’re writing
-    if "last_div" in df.columns:
-        preferred = ["ticker", "price", "last_div", "yield_last_div"]
-        yield_col = "yield_last_div"
-    else:
-        preferred = ["ticker", "price", "div_12m", "yield_ttm"]
-        yield_col = "yield_ttm"
+# ---------- CSV helpers (historical = ex-div events) ----------
+HIST_COLS = [
+    "Ticker", "Ex-Div Date", "Dividend", "Price on Ex-Date",
+    "Frequency", "Annualized Yield", "Scraped At Date"
+]
 
-    # Ensure columns exist and order nicely
-    for c in preferred:
-        if c not in df.columns:
-            df[c] = None
-    df = df[preferred + [c for c in df.columns if c not in preferred]]
-
-    # Sort by highest yield first (if present and non-empty)
-    if not df.empty and yield_col in df.columns:
-        df = df.sort_values(by=yield_col, ascending=False, kind="mergesort")
-
-    # Always write a file with headers, even if empty
-    df.to_csv(out_path, index=False)
-    print(f"[INFO] Wrote snapshot: {out_path} rows={len(df)}")
-
-def append_historical(rows: Iterable[Dict], out_path: str) -> None:
-    new_df = pd.DataFrame(list(rows))
+def append_historical_events(rows: Iterable[Dict], out_path: str) -> None:
+    """
+    Append ex-div event rows; de-duplicate on (Ticker, Ex-Div Date).
+    """
+    new_df = pd.DataFrame(list(rows), columns=HIST_COLS)
     if new_df.empty:
         return
     try:
         old = pd.read_csv(out_path)
         df = pd.concat([old, new_df], ignore_index=True)
-        if {"date", "ticker"}.issubset(df.columns):
-            df = df.drop_duplicates(subset=["date", "ticker"], keep="last")
     except FileNotFoundError:
         df = new_df
+    # Ensure correct cols exist/order
+    for c in HIST_COLS:
+        if c not in df.columns:
+            df[c] = None
+    # De-dupe on event key
+    df = df.drop_duplicates(subset=["Ticker", "Ex-Div Date"], keep="last")
+    df = df[HIST_COLS]
     df.to_csv(out_path, index=False)
 
-def read_existing_historical(path: str) -> pd.DataFrame:
+def read_historical_events(path: str) -> pd.DataFrame:
     try:
-        return pd.read_csv(path)
+        df = pd.read_csv(path)
+        # best effort typing
+        if "Ex-Div Date" in df.columns:
+            df["Ex-Div Date"] = pd.to_datetime(df["Ex-Div Date"], errors="coerce").dt.date
+        return df
     except FileNotFoundError:
-        return pd.DataFrame(columns=["date", "ticker", "price", "div_12m", "yield_ttm"])
+        return pd.DataFrame(columns=HIST_COLS)
 
 def prune_historical_to_days(path: str, keep_days: int = 1825) -> None:
-    """Keep only the last `keep_days` of data (default ~5 years)."""
-    df = read_existing_historical(path)
-    if df.empty or "date" not in df.columns:
+    """Keep only the last `keep_days` of events."""
+    df = read_historical_events(path)
+    if df.empty or "Ex-Div Date" not in df.columns:
         return
-    df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.date
     cutoff = (dt.date.today() - dt.timedelta(days=keep_days))
-    pruned = df[df["date"] >= cutoff].copy()
+    pruned = df[df["Ex-Div Date"] >= cutoff].copy()
     pruned.to_csv(path, index=False)
     print(f"[INFO] Pruned {path} to last {keep_days} days; rows={len(pruned)}")
+
+# ---------- CSV helper for daily snapshot ----------
+DAILY_COLS = [
+    "Last Updated (UTC)", "Ticker", "Name", "Price", "Currency",
+    "Last Dividend ($)", "Last Dividend Date", "Frequency",
+    "Current Yield (%)", "Yield Percentile (%)",
+    "Median Annualized Yield %", "Mean Annualized Yield %", "Std Dev %",
+    "Valuation"
+]
+
+def write_daily_snapshot(rows: Iterable[Dict], out_path: str) -> None:
+    df = pd.DataFrame(list(rows), columns=DAILY_COLS)
+    if "Current Yield (%)" in df.columns and not df.empty:
+        df = df.sort_values(by="Current Yield (%)", ascending=False, kind="mergesort")
+    df.to_csv(out_path, index=False)
+    print(f"[INFO] Wrote daily snapshot: {out_path} rows={len(df)}")
