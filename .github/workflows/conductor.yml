@@ -1,0 +1,48 @@
+# Purpose: Run the single "grand conductor" daily.
+# Behavior:
+#   - Cleans & validates ticker lists
+#   - Ensures history is complete (new backfills up to 5y; incremental 14d, 21d on Mondays)
+#   - Prunes history to 5 years hard cap
+#   - Writes current_* snapshots (based on most-recent dividend)
+#   - (Optional) Runs analytics if RUN_ANALYTICS=1
+# Schedule: once per day in UTC; adjust to suit Toronto DST if desired.
+
+name: Run Conductor (Daily)
+
+on:
+  schedule:
+    - cron: '0 13 * * *'  # 13:00 UTC ≈ 9am Toronto during EDT, 8am during EST
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  run-conductor:
+    runs-on: ubuntu-latest
+    env:
+      RUN_ANALYTICS: "0"   # set to "1" to compute metrics on each run
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas yfinance matplotlib
+
+      - name: Run conductor
+        run: python conductor.py
+
+      - name: Commit and push CSVs
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add current_etf_yields_*.csv historical_etf_yields_*.csv || true
+          git commit -m "Conductor: update history (5y cap) and current snapshots" || echo "Nothing to commit"
+          git push
