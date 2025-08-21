@@ -43,6 +43,6 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add graphs/*.png || true
+          git add -f graphs/*.png || true
           git commit -m "Add graph for ${{ github.event.inputs.ticker }}" || echo "Nothing to commit"
           git push
