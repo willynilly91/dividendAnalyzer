@@ -6,7 +6,7 @@ Purpose:
     - Backfilling NEW tickers (up to retention window, default 5 years)
     - Incrementally extending EXISTING tickers (from last event - grace)
   Each event row has: Ticker, Ex-Div Date, Dividend, Price on Ex-Date,
-  Frequency (inferred), Annualized Yield (%), Scraped At Date (UTC date).
+  Frequency (inferred), Annualized Yield (DECIMAL), Scraped At Date (UTC date).
   Batched requests with polite backoff to avoid throttling.
 
 Run cadence:
@@ -91,7 +91,7 @@ def _nearest_trading_close(price_index: pd.DatetimeIndex, exdate: pd.Timestamp) 
 def _build_event_rows(symbol: str, div: pd.Series, closes: pd.Series, start_date: dt.date, end_date: dt.date) -> List[Dict]:
     """
     Build rows for all ex-div events in [start_date, end_date].
-    Annualized Yield (%) = (Dividend * freq_multiplier / Price_on_Ex-Date) * 100
+    Annualized Yield (DECIMAL) = (Dividend * freq_multiplier / Price_on_Ex-Date)
     Frequency is inferred from median gap across the series (bounded to window if needed).
     """
     if div.empty:
@@ -121,14 +121,14 @@ def _build_event_rows(symbol: str, div: pd.Series, closes: pd.Series, start_date
         px = float(closes.loc[nearest])
         if px <= 0:
             continue
-        ann_yld_pct = (float(cash) * k / px) * 100.0
+        ann_yield_decimal = (float(cash) * k) / px  # *** DECIMAL, no *100 ***
         rows.append({
             "Ticker": symbol,
             "Ex-Div Date": ex_ts.date().isoformat(),
             "Dividend": float(cash),
             "Price on Ex-Date": px,
             "Frequency": freq_label,
-            "Annualized Yield": ann_yld_pct,
+            "Annualized Yield": ann_yield_decimal,
             "Scraped At Date": scraped_date,
         })
     return rows
