@@ -20,8 +20,9 @@ Run cadence:
   On demand via workflow_dispatch (see .github/workflows/plot_graph.yml).
 """
 from __future__ import annotations
-import sys, os, math
+import sys
 from pathlib import Path
+import math
 import pandas as pd
 import matplotlib.pyplot as plt
 import yfinance as yf
@@ -30,7 +31,7 @@ HIST_CA = Path("historical_etf_yields_canada.csv")
 HIST_US = Path("historical_etf_yields_us.csv")
 OUT_DIR = Path("graphs")
 
-def _load_history_from_csvs(ticker: str) -> pd.DataFrame:
+def _load_history_from_csvs(ticker: str) -> pd.Series:
     dfs = []
     for p in (HIST_CA, HIST_US):
         if p.exists():
@@ -38,11 +39,12 @@ def _load_history_from_csvs(ticker: str) -> pd.DataFrame:
             if not df.empty:
                 dfs.append(df[df["ticker"] == ticker])
     if not dfs:
-        return pd.DataFrame(columns=["date","ticker","price","div_12m","yield_ttm"])
+        return pd.Series(dtype=float)
     out = pd.concat(dfs, ignore_index=True)
     out["date"] = pd.to_datetime(out["date"], errors="coerce")
     out = out.dropna(subset=["date"]).sort_values("date")
-    return out
+    s = out.set_index("date")["price"].astype(float)
+    return s
 
 def _load_dividends(ticker: str) -> pd.Series:
     t = yf.Ticker(ticker)
@@ -53,25 +55,17 @@ def _load_dividends(ticker: str) -> pd.Series:
     return div
 
 def _nearest_close(date_index: pd.DatetimeIndex, target: pd.Timestamp) -> pd.Timestamp | None:
-    # find the nearest trading day in our historical CSV around ex-div date
     if len(date_index) == 0:
         return None
     pos = date_index.get_indexer([target], method="nearest")[0]
     return date_index[max(0, min(pos, len(date_index)-1))]
 
 def _compute_total_return(price_series: pd.Series, div_series: pd.Series) -> pd.Series:
-    """
-    Reinvest dividends on ex-div dates at the (nearest) close price.
-    Start with $10,000 and let shares accumulate.
-    """
     if price_series.empty:
         return pd.Series(dtype=float)
-
-    # base: first price
     first_price = float(price_series.iloc[0])
     if not math.isfinite(first_price) or first_price <= 0:
         return pd.Series(dtype=float)
-
     shares = 10000.0 / first_price
     tr_values = []
 
@@ -89,8 +83,7 @@ def _compute_total_return(price_series: pd.Series, div_series: pd.Series) -> pd.
     for d, px in price_series.items():
         if d in div_map and px > 0:
             cash = div_map[d] * shares
-            # reinvest: buy more shares at today's close
-            shares += (cash / px)
+            shares += (cash / px)  # reinvest
         tr_values.append(shares * px)
 
     return pd.Series(tr_values, index=price_series.index, name="TR_$")
@@ -98,8 +91,8 @@ def _compute_total_return(price_series: pd.Series, div_series: pd.Series) -> pd.
 def plot_ticker(ticker: str) -> Path:
     OUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    hist = _load_history_from_csvs(ticker)
-    if hist.empty:
+    price = _load_history_from_csvs(ticker)
+    if price.empty:
         # fallback: pull minimal price history so we can still draw something
         t = yf.Ticker(ticker)
         tmp = t.history(period="5y", interval="1d", auto_adjust=False)
@@ -107,8 +100,6 @@ def plot_ticker(ticker: str) -> Path:
             raise SystemExit(f"No data for {ticker}")
         price = tmp["Close"].rename("price")
         price.index = pd.to_datetime(price.index)
-    else:
-        price = hist.set_index(pd.to_datetime(hist["date"]))["price"].astype(float)
 
     div = _load_dividends(ticker)
 
@@ -141,7 +132,7 @@ def plot_ticker(ticker: str) -> Path:
 
     # second left axis for total return
     ax_tr = ax_price.twinx()
-    ax_tr.spines.right.set_position(("axes", 1.08))  # move TR axis outward to avoid overlap
+    ax_tr.spines.right.set_position(("axes", 1.08))
     if not tr.empty:
         ax_tr.plot(tr.index, tr.values, linestyle="--", label="TR of $10,000")
     ax_tr.set_ylabel("Total Return ($)")
@@ -156,7 +147,7 @@ def plot_ticker(ticker: str) -> Path:
     title = f"{ticker} — Price, Dividends, TR($10k), Yield@Ex-Div"
     ax_price.set_title(title)
 
-    # simple legend handling
+    # legend
     lines, labels = [], []
     for a in (ax_price, ax_div, ax_tr):
         h, l = a.get_legend_handles_labels()
