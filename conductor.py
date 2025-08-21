@@ -80,7 +80,7 @@ def _load_checked(path: str, country: str) -> List[str]:
     syms = load_and_prepare_tickers(path, country)
     valid, mismatched = validate_tickers(syms, country)
     if mismatched:
-        print(f"[WARN] {path}: {len(mismatched)} mismatched → excluded: {mismatched}")
+        print(f("[WARN] {path}: {len(mismatched)} mismatched → excluded: {mismatched}"))
     return valid
 
 def _build_current_rows(symbols: List[str], *, chunk_size=60, sleep_between=1.0) -> List[Dict]:
@@ -104,6 +104,14 @@ def _env_true(name: str, default: bool) -> bool:
     if val is None:
         return default
     return val.strip().lower() in ("1", "true", "yes", "y", "on")
+
+def _stat(path: str):
+    import os
+    try:
+        b = os.path.getsize(path)
+        print(f"[INFO] File exists: {path} size={b} bytes")
+    except FileNotFoundError:
+        print(f"[WARN] File missing: {path}")
 
 def main() -> None:
     today = dt.date.today()
@@ -131,6 +139,10 @@ def main() -> None:
     # 3) Write today's CURRENT snapshots (most-recent dividend based)
     write_current_snapshot(_build_current_rows(ca_list), "current_etf_yields_canada.csv")
     write_current_snapshot(_build_current_rows(us_list), "current_etf_yields_us.csv")
+
+    # Verify presence (helps debug CI)
+    _stat("current_etf_yields_canada.csv")
+    _stat("current_etf_yields_us.csv")
 
     # 4) Optional analytics (set RUN_ANALYTICS=1 in workflow env to enable)
     if _env_true("RUN_ANALYTICS", False):
