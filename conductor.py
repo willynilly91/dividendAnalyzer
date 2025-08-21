@@ -8,19 +8,20 @@ Purpose:
        - Backfills NEW tickers (up to 5y)
        - Incrementally extends EXISTING tickers (grace 14d; 21d on Mondays)
     3) Builds "daily" snapshot using MOST-RECENT dividend
-       - Current Yield (%) = last_div / current_price * 100 (not annualized)
-       - Yield Percentile (%) vs history of (Dividend/Price_on_Ex-Date) events
-       - Median/Mean/Std Dev of Annualized Yield % from event history
-       - Valuation classification using current *annualized* yield vs mean±std
+       - Current Yield (decimal) = (last_div * freq_per_year) / current_price
+       - Yield Percentile (decimal 0..100) vs history of Annualized Yield (decimal)
+       - Median/Mean/Std Dev of Annualized Yield (decimal)
+       - Valuation using current annualized yield vs mean±std
     4) Writes daily CSVs
 
 Intended workflow schedule:
   Daily (e.g., 13:00 UTC ~ 9am Toronto in summer).
 """
 from __future__ import annotations
-import os, time, math, statistics
+import os, time, math
 import datetime as dt
 from typing import List, Dict, Tuple
+import numpy as np
 import pandas as pd
 import yfinance as yf
 
@@ -28,7 +29,7 @@ from tickers_io import (
     load_and_prepare_tickers, validate_tickers,
     write_daily_snapshot, read_historical_events
 )
-from history_updater import ensure_history, _freq_label_from_days, _freq_multiplier
+from history_updater import ensure_history
 
 # --- batching/backoff for today's fetch ---
 def chunked(xs: List[str], n: int):
@@ -60,8 +61,9 @@ def _fetch_prices_batch(symbols: List[str]) -> Dict[str, Tuple[float|None, str|N
         curr = None
         try:
             info = tickers.tickers[s].fast_info
-            price = info.last_price
-            curr = getattr(info, "currency", None) or info.get("currency", None)
+            # fast_info is dict-like in newer yfinance; support both attr and dict access
+            price = getattr(info, "last_price", None) or (info.get("last_price") if hasattr(info, "get") else None)
+            curr = getattr(info, "currency", None) or (info.get("currency") if hasattr(info, "get") else None)
             if price is None:
                 h = tickers.tickers[s].history(period="1d", auto_adjust=False)
                 price = float(h["Close"].iloc[-1]) if not h.empty else None
@@ -88,23 +90,54 @@ def _fetch_name(symbol: str) -> str:
     except Exception:
         return symbol
 
+def _freq_label_from_gaps(days: float) -> str:
+    if days <= 10:
+        return "weekly"
+    if days <= 45:
+        return "monthly"
+    if days <= 110:
+        return "quarterly"
+    if days <= 220:
+        return "semiannual"
+    return "annual"
+
+def _freq_multiplier(label: str) -> int:
+    return {
+        "weekly": 52,
+        "monthly": 12,
+        "quarterly": 4,
+        "semiannual": 2,
+        "annual": 1,
+    }.get(label, 1)
+
 def _infer_overall_frequency_from_history(hist_df: pd.DataFrame, ticker: str) -> str:
+    """
+    Infer payout frequency label from ex-div date gaps in event history.
+    """
     df = hist_df[hist_df["Ticker"] == ticker].dropna(subset=["Ex-Div Date"])
     if len(df) < 2:
         return "annual"
-    # infer from ex-div event gaps
-    dates = pd.to_datetime(df["Ex-Div Date"]).sort_values().to_series()
+    dates = pd.to_datetime(df["Ex-Div Date"]).sort_values()
     gaps = dates.diff().dt.days.dropna()
     if gaps.empty:
         return "annual"
-    return _freq_label_from_days(float(gaps.median()))
+    return _freq_label_from_gaps(float(gaps.median()))
 
-def _percentile_rank(values: List[float], x: float) -> float:
-    if not values:
+def _percentile_rank(sorted_values: List[float], x: float) -> float:
+    """
+    Percentile rank (0..100) of x within sorted_values (inclusive).
+    """
+    if not sorted_values:
         return 0.0
-    # inclusive percentile rank
-    below = sum(1 for v in values if v <= x)
-    return (below / len(values)) * 100.0
+    # binary search count of <= x
+    lo, hi = 0, len(sorted_values)
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if sorted_values[mid] <= x:
+            lo = mid + 1
+        else:
+            hi = mid
+    return (lo / len(sorted_values)) * 100.0
 
 def _valuation(mean_a: float|None, std_a: float|None, current_a: float|None) -> str:
     if any(v is None or not math.isfinite(v) for v in (mean_a, std_a, current_a)) or std_a == 0:
@@ -116,33 +149,33 @@ def _valuation(mean_a: float|None, std_a: float|None, current_a: float|None) -> 
     return "fairly priced"
 
 def _build_daily_rows(symbols: List[str], hist_path: str, *, chunk_size=40, sleep_between=1.0) -> List[Dict]:
-    hist = read_historical_events(hist_path)  # event history with Annualized Yield (%)
+    """
+    Build rows for the daily snapshot:
+      - All yields are ANNUALIZED and stored as DECIMALS (e.g., 0.10 for 10%)
+      - Percentile is computed vs historical Annualized Yield (decimal)
+    """
+    hist = read_historical_events(hist_path)  # event history with 'Annualized Yield' (decimal)
     rows: List[Dict] = []
     now_utc = dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
 
-    # Precompute per-ticker stats from history
-    stats_cache: Dict[str, Dict[str, float]] = {}
+    # Precompute per-ticker stats from history (annualized yields)
+    stats_cache: Dict[str, Dict[str, float|list]] = {}
     for tck, df_t in hist.groupby("Ticker"):
-        # annualized stats
-        ann = [float(x) for x in df_t["Annualized Yield"].dropna().tolist()]
-        if ann:
-            median_a = float(pd.Series(ann).median())
-            mean_a   = float(pd.Series(ann).mean())
-            std_a    = float(pd.Series(ann).std(ddof=0))  # population std
+        ay = pd.to_numeric(df_t["Annualized Yield"], errors="coerce")
+        ay = ay.replace([np.inf, -np.inf], np.nan).dropna()
+        if not ay.empty:
+            median_a = float(ay.median())
+            mean_a   = float(ay.mean())
+            std_a    = float(ay.std(ddof=0))  # population std
+            sorted_a = sorted(float(v) for v in ay.tolist())
         else:
             median_a = mean_a = std_a = float("nan")
-
-        # non-annualized event yields for percentile: Dividend / Price on Ex-Date
-        non_ann = []
-        if not df_t.empty:
-            with pd.option_context('mode.use_inf_as_na', True):
-                y = (df_t["Dividend"].astype(float) / df_t["Price on Ex-Date"].astype(float)) * 100.0
-                non_ann = [float(v) for v in y.dropna().tolist()]
-
+            sorted_a = []
         stats_cache[tck] = {
-            "median_a": median_a, "mean_a": mean_a, "std_a": std_a,
-            "non_ann_count": len(non_ann),
-            "non_ann_sorted": sorted(non_ann)
+            "median_a": median_a,
+            "mean_a": mean_a,
+            "std_a": std_a,
+            "sorted_a": sorted_a,
         }
 
     # Fetch live data in batches
@@ -153,27 +186,25 @@ def _build_daily_rows(symbols: List[str], hist_path: str, *, chunk_size=40, slee
             last_div, last_div_date = _fetch_last_div_and_date(s)
             name = _fetch_name(s)
 
-            # current non-annualized yield (%)
-            if price and price > 0:
-                current_yield_pct = (last_div / price) * 100.0
-            else:
-                current_yield_pct = 0.0
-
             # frequency (overall inference from historical)
             freq = _infer_overall_frequency_from_history(hist, s)
             k = _freq_multiplier(freq)
-            # current annualized yield (%) for valuation-only
-            current_ann_pct = (last_div * k / price) * 100.0 if (price and price > 0) else float("nan")
 
-            # stats
+            # current annualized yield (decimal)
+            if price and price > 0:
+                current_ann = (last_div * k) / price
+            else:
+                current_ann = float("nan")
+
+            # stats & percentile
             st = stats_cache.get(s, {})
             median_a = st.get("median_a", float("nan"))
             mean_a   = st.get("mean_a", float("nan"))
             std_a    = st.get("std_a", float("nan"))
-            non_ann_vals = st.get("non_ann_sorted", [])
-            perc = _percentile_rank(non_ann_vals, current_yield_pct) if non_ann_vals else 0.0
+            sorted_a = st.get("sorted_a", [])
 
-            val = _valuation(mean_a, std_a, current_ann_pct)
+            perc = _percentile_rank(sorted_a, current_ann) if (sorted_a and math.isfinite(current_ann)) else 0.0
+            val = _valuation(mean_a, std_a, current_ann)
 
             rows.append({
                 "Last Updated (UTC)": now_utc,
@@ -184,11 +215,11 @@ def _build_daily_rows(symbols: List[str], hist_path: str, *, chunk_size=40, slee
                 "Last Dividend ($)": last_div,
                 "Last Dividend Date": last_div_date.isoformat() if last_div_date else "",
                 "Frequency": freq,
-                "Current Yield (%)": current_yield_pct,
-                "Yield Percentile (%)": perc,
-                "Median Annualized Yield %": median_a,
-                "Mean Annualized Yield %": mean_a,
-                "Std Dev %": std_a,
+                "Current Yield": current_ann,                # decimal
+                "Yield Percentile": perc,                    # 0..100
+                "Median Annualized Yield": median_a,         # decimal
+                "Mean Annualized Yield": mean_a,             # decimal
+                "Std Dev": std_a,                            # decimal
                 "Valuation": val,
             })
         time.sleep(sleep_between)
@@ -222,7 +253,7 @@ def main() -> None:
         chunk_size_backfill=10, chunk_size_incremental=40, sleep_between_chunks=1.0
     )
 
-    # 3) Build & write daily snapshots (sorted by Current Yield % desc)
+    # 3) Build & write daily snapshots (sorted by Current Yield desc)
     write_daily_snapshot(
         _build_daily_rows(ca_list, "historical_etf_yields_canada.csv"),
         "current_etf_yields_canada.csv"
