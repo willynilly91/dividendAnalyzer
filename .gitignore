@@ -1,0 +1,10 @@
+# Python
+__pycache__/
+*.pyc
+
+# OS
+.DS_Store
+
+# Outputs
+current_etf_yields_*.csv
+historical_etf_yields_*.csv
