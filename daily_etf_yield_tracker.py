@@ -19,7 +19,9 @@ def build_rows(symbols: List[str]) -> List[Dict]:
     return rows
 
 def _load_checked(path: str, country: str) -> List[str]:
+    # normalize -> dedupe -> sort
     symbols = load_and_prepare_tickers(path, country)
+    # validate country via Yahoo exchange field
     valid, mismatched, unknown = validate_tickers(symbols, country)
     if mismatched:
         print(f"[WARN] {path}: {len(mismatched)} mismatched tickers:", mismatched)
