@@ -12,7 +12,7 @@ Run cadence:
   Imported by other scripts; not run directly.
 """
 from __future__ import annotations
-from typing import Iterable, List, Dict, Set, Tuple
+from typing import Iterable, List, Dict, Tuple
 import datetime as dt
 import pandas as pd
 
@@ -95,11 +95,13 @@ def write_current_snapshot(rows: Iterable[Dict], out_path: str) -> None:
             df[c] = None
     df = df[preferred + [c for c in df.columns if c not in preferred]]
 
-    # Sort by highest yield first (if present)
-    if yield_col in df.columns:
+    # Sort by highest yield first (if present and non-empty)
+    if not df.empty and yield_col in df.columns:
         df = df.sort_values(by=yield_col, ascending=False, kind="mergesort")
 
+    # Always write a file with headers, even if empty
     df.to_csv(out_path, index=False)
+    print(f"[INFO] Wrote snapshot: {out_path} rows={len(df)}")
 
 def append_historical(rows: Iterable[Dict], out_path: str) -> None:
     new_df = pd.DataFrame(list(rows))
@@ -129,3 +131,4 @@ def prune_historical_to_days(path: str, keep_days: int = 1825) -> None:
     cutoff = (dt.date.today() - dt.timedelta(days=keep_days))
     pruned = df[df["date"] >= cutoff].copy()
     pruned.to_csv(path, index=False)
+    print(f"[INFO] Pruned {path} to last {keep_days} days; rows={len(pruned)}")
