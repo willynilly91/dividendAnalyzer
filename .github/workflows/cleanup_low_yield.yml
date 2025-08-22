@@ -1,0 +1,73 @@
+name: Cleanup: Remove Low-Yield Tickers
+
+on:
+  workflow_dispatch:
+    inputs:
+      threshold:
+        description: "Yield cutoff (e.g., 5%, 5, or 0.05 for 5%)"
+        required: true
+        type: string
+        default: "5%"
+      dry_run:
+        description: "Preview only (no files written)?"
+        required: true
+        type: choice
+        options: [no, yes]
+        default: no
+      make_backups:
+        description: "Create .bak backups before overwriting?"
+        required: true
+        type: choice
+        options: [yes, no]
+        default: yes
+
+permissions:
+  contents: write
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas numpy
+
+      - name: Run cleanup
+        env:
+          THRESHOLD: ${{ github.event.inputs.threshold }}
+          DRY: ${{ github.event.inputs.dry_run }}
+          BAK: ${{ github.event.inputs.make_backups }}
+        run: |
+          set -euo pipefail
+          if [ "$DRY" = "yes" ]; then
+            DRY_FLAG="--dry-run"
+          else
+            DRY_FLAG=""
+          fi
+          if [ "$BAK" = "no" ]; then
+            BAK_FLAG="--no-backup"
+          else
+            BAK_FLAG=""
+          fi
+
+          python clean_low_yield_tickers.py --threshold "$THRESHOLD" $DRY_FLAG $BAK_FLAG
+
+      - name: Commit and push changes (CSV + .bak if any)
+        if: ${{ github.event.inputs.dry_run != 'yes' }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          # Add changed CSVs and any backups produced
+          git add -f *.csv *.csv.*.bak || true
+          git commit -m "Cleanup: remove low-yield tickers below ${{ github.event.inputs.threshold }}" || echo "Nothing to commit"
+          git push || true
