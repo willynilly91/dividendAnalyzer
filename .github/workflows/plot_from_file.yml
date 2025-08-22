@@ -16,6 +16,12 @@ on:
         required: true
         type: string
         default: graphs
+      force_replot:
+        description: "Force re-plot even if PNG is already up-to-date?"
+        required: true
+        type: choice
+        options: [no, yes]
+        default: no
 
 permissions:
   contents: write
@@ -23,6 +29,7 @@ permissions:
 jobs:
   plot-from-file:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -32,30 +39,48 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install dependencies
+      - name: Install dependencies (plotting + bootstrap scraping)
         run: |
           python -m pip install --upgrade pip
-          pip install pandas numpy matplotlib
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          else
+            # Core libs for your plotter and for history_updater bootstrap path
+            pip install pandas numpy matplotlib yfinance requests beautifulsoup4 lxml
+          fi
 
       - name: Decide currency based on file
         id: decide
         run: |
-          case "${{ github.event.inputs.tickers_file }}" in
-            us_tickers.txt) echo "currency=USD" >> $GITHUB_OUTPUT ;;
-            ca_tickers.txt) echo "currency=CAD" >> $GITHUB_OUTPUT ;;
-            *) echo "currency=USD" >> $GITHUB_OUTPUT ;; # fallback
+          FILE="${{ github.event.inputs.tickers_file }}"
+          case "$FILE" in
+            us_tickers.txt) CURRENCY=USD ;;
+            ca_tickers.txt) CURRENCY=CAD ;;
+            *)
+              # Fallback heuristic: filenames containing "ca" → CAD; else USD
+              if echo "$FILE" | grep -Ei '(^|[_-])(ca|cad)([_.-]|$)' >/dev/null; then
+                CURRENCY=CAD
+              else
+                CURRENCY=USD
+              fi
+              ;;
           esac
+          echo "currency=$CURRENCY" >> "$GITHUB_OUTPUT"
+          echo "Selected file: $FILE | Decided currency: $CURRENCY"
 
-      - name: Generate graphs for all tickers
+      - name: Generate graphs for all tickers in file
         shell: bash
         env:
           TICKERS_FILE: ${{ github.event.inputs.tickers_file }}
           CURRENCY: ${{ steps.decide.outputs.currency }}
           OUTDIR: ${{ github.event.inputs.outdir }}
+          FORCE: ${{ github.event.inputs.force_replot }}
         run: |
           set -euo pipefail
+
           if [ ! -f "$TICKERS_FILE" ]; then
             echo "ERROR: Tickers file not found: $TICKERS_FILE"
+            echo "Repo root contents:"; ls -la
             exit 1
           fi
 
@@ -64,32 +89,47 @@ jobs:
           total=0; ok=0; failed=0
           while IFS= read -r line || [ -n "$line" ]; do
             ticker="$(echo "$line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+            # Skip blanks / comments
             if [ -z "$ticker" ] || [[ "$ticker" =~ ^# ]]; then
               continue
             fi
             total=$((total+1))
-            echo "::group::Plotting $ticker ($CURRENCY)"
+            echo "Plotting $ticker ($CURRENCY)"
+            if [ "$FORCE" = "yes" ]; then
+              FORCE_FLAG="--force"
+            else
+              FORCE_FLAG=""
+            fi
             set +e
-            python plot_ticker_graph.py "$ticker" --currency "$CURRENCY" --outdir "$OUTDIR"
+            python plot_ticker_graph.py "$ticker" --currency "$CURRENCY" --outdir "$OUTDIR" $FORCE_FLAG
             rc=$?
             set -e
             if [ $rc -eq 0 ]; then
-              echo "[ok] $ticker"; ok=$((ok+1))
+              echo "  [ok] $ticker"
+              ok=$((ok+1))
             else
-              echo "[warn] Failed for $ticker (exit $rc)"; failed=$((failed+1))
+              echo "  [warn] Failed for $ticker (exit $rc)"
+              failed=$((failed+1))
             fi
-            echo "::endgroup::"
           done < "$TICKERS_FILE"
 
           echo "Summary: total=$total ok=$ok failed=$failed"
+          # Don't fail the job if some tickers failed; artifacts will still be committed
           if [ $ok -eq 0 ]; then
             echo "No graphs produced."
           fi
 
-      - name: Commit and push PNGs
+      - name: List outputs
+        run: |
+          echo "=== Output directory ==="
+          ls -la "${{ github.event.inputs.outdir }}" || true
+
+      - name: Commit and push artifacts (PNGs and any updated ticker lists)
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add -f "${{ github.event.inputs.outdir }}"/*.png || true
-          git commit -m "Add graphs from ${{ github.event.inputs.tickers_file }} (currency ${{ steps.decide.outputs.currency }})" || echo "Nothing to commit"
+          # Include updated tickers files (plotter may append new symbols)
+          git add -f us_tickers.txt ca_tickers.txt || true
+          git commit -m "Graphs from ${{ github.event.inputs.tickers_file }} (currency ${{ steps.decide.outputs.currency }})" || echo "Nothing to commit"
           git push || true
