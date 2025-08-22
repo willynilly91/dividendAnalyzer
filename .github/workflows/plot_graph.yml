@@ -1,22 +1,17 @@
-# Purpose: On-demand graph generator for a single ticker.
-# Adds a CAD/USD radio button and passes it to the script.
-
 name: Plot Ticker Graph (On Demand)
 
 on:
   workflow_dispatch:
     inputs:
       ticker:
-        description: "Ticker symbol (Yahoo format, e.g., EIT-UN.TO)"
+        description: "Ticker (Yahoo format, e.g., ULTY or EIT-UN.TO)"
         required: true
         type: string
       currency:
-        description: "Currency for history CSV"
+        description: "Currency / history CSV to use"
         required: true
         type: choice
-        options:
-          - CAD
-          - USD
+        options: [CAD, USD]
         default: USD
 
 permissions:
@@ -29,5 +24,39 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: Set up Python 3.11
         uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Show Python & files
+        run: |
+          python --version
+          ls -la
+          ls -la graphs || true
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas matplotlib
+
+      - name: Generate graph
+        env:
+          INPUT_TICKER: ${{ github.event.inputs.ticker }}
+          INPUT_CURRENCY: ${{ github.event.inputs.currency }}
+        run: |
+          mkdir -p graphs
+          python plot_ticker_graph.py "${INPUT_TICKER}" "${INPUT_CURRENCY}"
+
+      - name: List outputs
+        run: |
+          ls -la graphs || true
+          tail -n +1 graphs/*_debug_sample.csv || true
+
+      - name: Commit and push artifacts
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -f graphs/*.png graphs/*_debug_sample.csv || true
+          git commit -m "Add graph for ${{ github.event.inputs.ticker }} (${{ github.event.inputs.currency }})" || echo "Nothing to commit"
+          git push || true
