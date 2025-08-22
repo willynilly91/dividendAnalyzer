@@ -1,9 +1,5 @@
 # Purpose: On-demand graph generator for a single ticker.
-# Behavior:
-#   - Takes user-supplied 'ticker' via workflow_dispatch input
-#   - Runs plot_ticker_graph.py to produce graphs/<TICKER>_history.png
-#   - Commits the PNG to the repository
-# Schedule: none (manual only). Trigger via Actions → "Run workflow".
+# Adds a CAD/USD radio button and passes it to the script.
 
 name: Plot Ticker Graph (On Demand)
 
@@ -14,6 +10,14 @@ on:
         description: "Ticker symbol (Yahoo format, e.g., EIT-UN.TO)"
         required: true
         type: string
+      currency:
+        description: "Currency for history CSV"
+        required: true
+        type: choice
+        options:
+          - CAD
+          - USD
+        default: USD
 
 permissions:
   contents: write
@@ -27,22 +31,3 @@ jobs:
 
       - name: Set up Python
         uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install pandas yfinance matplotlib
-
-      - name: Generate graph
-        run: |
-          python plot_ticker_graph.py "${{ github.event.inputs.ticker }}"
-
-      - name: Commit and push PNG
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add -f graphs/*.png || true
-          git commit -m "Add graph for ${{ github.event.inputs.ticker }}" || echo "Nothing to commit"
-          git push
