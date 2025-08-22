@@ -2,22 +2,21 @@
 """
 plot_ticker_graph.py
 
-Generates a chart for a single ticker showing:
-  - Price on Ex-Date ($ <currency>)  ........ red line (LEFT base axis)
-  - Dividends ($) ............................ blue bars (LEFT extra axis)
-  - Growth of $10,000 ........................ green solid (LEFT extra axis, bold)
-  - Growth of $10,000 (Less 15% US Witholding Tax) ... green solid (LEFT extra axis, thin)  [USD only]
-  - Total Annualized Return (%) .............. darkened light-green dashed (RIGHT extra axis, bold; starts after >=12 months)
-  - Total Annualized Return less 15% US Witholding Tax (%) ... darkened light-green dashed (RIGHT extra axis, thin; starts after >=12 months) [USD only]
-  - Annualized Yield (%) ..................... dark orange dashed (RIGHT extra axis)  ← from CSV
+Series you can toggle on/off (via CLI flags, set by the workflows below):
+  - Price on Ex-Date ($ <currency>)                               --price
+  - Dividends ($)                                                  --dividends
+  - Growth of $10,000                                              --growth
+  - Growth of $10,000 (Less 15% US Withholding Tax) [USD only]     --growth-wht
+  - Total Annualized Return (%)  [starts after >= 12 months]       --ann
+  - Total Annualized Return less 15% US Withholding Tax (%) [USD]  --ann-wht
+  - Annualized Yield (%) (from CSV)                                --yield
 
-Quality-of-life:
-  - --currency USD|CAD chooses which CSV to read and which ticker list file to update
-  - If ticker is missing from CSV, script:
-      * appends DOT-form (e.g., HYLD.TO) to the appropriate ticker list (us_tickers.txt / ca_tickers.txt)
-      * scrapes history immediately via history_updater.ensure_history([...], <csv>)
-      * reloads and continues
-  - Skip plotting if existing PNG is at least as new as latest data DATE (override with --force)
+Other features:
+  - CAD tickers automatically **ignore** the US-withholding lines, even if requested.
+  - Annualized Return lines now start only after **365 days** of data.
+  - Robust symbol handling for dot/dash Canadian suffixes (.TO / -TO).
+  - If a ticker is missing in CSVs: appends Yahoo dot-form to the right list, scrapes via history_updater, reloads, and plots.
+  - Skip re-plot if PNG file-date (UTC) is on/after latest data date (unless --force).
 """
 
 from __future__ import annotations
@@ -39,12 +38,12 @@ LIST_CA = Path("ca_tickers.txt")  # created on demand
 CA_SUFFIXES_DOT  = (".TO", ".NE", ".V", ".CN")
 CA_SUFFIXES_DASH = ("-TO", "-NE", "-V", "-CN")
 
-# Colors
+# Colors (keep your style)
 RED = "#D62728"          # Price
 BLUE = "#1F77B4"         # Dividends
 GREEN = "#2CA02C"        # Growth of $10,000 (both untaxed/taxed)
-ANN_GREEN = "#2E8B57"    # Darkened light-green for Annualized Return (%)
-DARK_ORANGE = "#B86E00"  # Yield
+ANN_GREEN = "#2E8B57"    # Annualized Return (%)
+DARK_ORANGE = "#B86E00"  # Annualized Yield
 
 # ---------- symbol normalization & variants ----------
 def _strip_prefixes(sym: str) -> str:
@@ -100,7 +99,7 @@ def _yahoo_symbol(sym: str) -> str:
         return _to_dot_suffix(s)
     return s  # US
 
-def infer_currency_from_symbol(sym: str) -> str:
+def _infer_currency_from_symbol(sym: str) -> str:
     s = sym.upper()
     return "CAD" if s.endswith(CA_SUFFIXES_DOT) or s.endswith(CA_SUFFIXES_DASH) else "USD"
 
@@ -117,7 +116,6 @@ def _read_histories(currency: str | None = None) -> pd.DataFrame:
                 frames.append(pd.read_csv(p))
     if not frames:
         raise SystemExit("No historical CSV found. Expected historical_etf_yields_us.csv and/or historical_etf_yields_canada.csv")
-
     df = pd.concat(frames, ignore_index=True)
 
     needed = {"Ticker", "Ex-Div Date"}
@@ -138,7 +136,7 @@ def _read_histories(currency: str | None = None) -> pd.DataFrame:
 
     return df
 
-# ---------- scaling / helpers ----------
+# ---------- helpers ----------
 def mean_std_bounds(series: pd.Series, clamp_zero: bool) -> tuple[float, float]:
     s = pd.Series(series).replace([np.inf, -np.inf], np.nan).dropna()
     if s.empty:
@@ -181,7 +179,6 @@ def growth_series(dates: pd.Series, price: pd.Series, div: pd.Series, div_factor
     return pd.Series(vals, index=dates)
 
 def annualized_return_series(growth_path: pd.Series, min_days: int = 365) -> pd.Series:
-    """Inception-to-date annualized %; start after >= min_days (default 365)."""
     out = pd.Series(index=growth_path.index, dtype=float)
     if growth_path.empty:
         return out.dropna()
@@ -263,12 +260,24 @@ def _bootstrap_if_missing(hist_all: pd.DataFrame, user_input: str, currency: str
     if not reloaded[reloaded["Ticker"].astype(str) == yahoo].empty:
         return reloaded, yahoo
     for v in _symbol_variants(yahoo):
-        if not reloaded[reloaded["Ticker"].astype[str] == v].empty:
+        if not reloaded[reloaded["Ticker"].astype(str) == v].empty:
             return reloaded, v
     raise SystemExit(f"Failed to bootstrap history for {yahoo} ({currency}).")
 
 # ---------- main plotting ----------
-def plot_distribution_analysis(ticker: str, outdir: Path, currency: str | None = None, force: bool = False) -> Path | None:
+def plot_distribution_analysis(
+    ticker: str,
+    outdir: Path,
+    currency: str | None = None,
+    force: bool = False,
+    show_price: bool = False,
+    show_dividends: bool = False,
+    show_growth: bool = False,
+    show_growth_wht: bool = False,
+    show_ann: bool = False,
+    show_ann_wht: bool = False,
+    show_yield: bool = False,
+) -> Path | None:
     cur = (currency or "").upper().strip() or None
     hist = _read_histories(currency=cur)
 
@@ -283,7 +292,7 @@ def plot_distribution_analysis(ticker: str, outdir: Path, currency: str | None =
 
     if chosen is None:
         if cur is None:
-            cur = infer_currency_from_symbol(ticker)
+            cur = _infer_currency_from_symbol(ticker)
             print(f"[INFO] Currency not provided. Inferred {cur} from '{ticker}'.")
         hist, chosen = _bootstrap_if_missing(hist, ticker, cur)
 
@@ -308,104 +317,119 @@ def plot_distribution_analysis(ticker: str, outdir: Path, currency: str | None =
     price = df["Price on Ex-Date"].astype(float)
     div = df["Dividend"].astype(float).fillna(0.0)
 
-    # Currency from CSV if available; else infer from symbol / arg
-    if "Currency" in df.columns and df["Currency"].notna().any():
-        cur_from_csv = df["Currency"].dropna().iloc[-1]
-        if cur_from_csv in ("USD", "CAD"):
-            cur = cur_from_csv
-    if not cur:
-        cur = infer_currency_from_symbol(symbol)
+    # Currency: CLI has priority; else CSV; else infer
+    if cur is None:
+        if "Currency" in df.columns and df["Currency"].notna().any():
+            cur_csv = df["Currency"].dropna().iloc[-1]
+            if cur_csv in ("USD", "CAD"):
+                cur = cur_csv
+        if cur is None:
+            cur = _infer_currency_from_symbol(symbol)
+
+    is_us = (cur == "USD")  # controls WHT series regardless of flags
 
     # Annualized Yield (%) from CSV
     yld_pct_series = _annualized_yield_percent(df)
+    n_finite = int(np.isfinite(yld_pct_series.values).sum())
 
-    # Diagnostics
-    finite_mask = np.isfinite(yld_pct_series.values)
-    n_total = len(yld_pct_series)
-    n_finite = int(np.sum(finite_mask))
-    print(f"[INFO] Annualized Yield points for {symbol}: total={n_total}, finite={n_finite}")
-
-    # Growth paths
-    growth = growth_series(dates, price, div, div_factor=1.0)
-
-    # USD-only taxed growth
-    plot_taxed = (cur == "USD")
-    if plot_taxed:
+    # Growth paths (compute only if needed)
+    growth = pd.Series(dtype=float, index=dates)
+    growth_wht = pd.Series(dtype=float, index=dates)
+    if show_growth or (show_ann and not dates.empty):
+        growth = growth_series(dates, price, div, div_factor=1.0)
+    if is_us and (show_growth_wht or (show_ann_wht and not dates.empty)):
         growth_wht = growth_series(dates, price, div, div_factor=0.85)
-    else:
-        growth_wht = pd.Series(dtype=float, index=dates)
 
     # Annualized % (start after >= 12 months)
-    ann = annualized_return_series(growth, min_days=365)
-    ann_wht = annualized_return_series(growth_wht, min_days=365) if plot_taxed else pd.Series(dtype=float, index=dates)
+    ann = annualized_return_series(growth, min_days=365) if show_ann and not growth.empty else pd.Series(dtype=float, index=dates)
+    ann_wht = annualized_return_series(growth_wht, min_days=365) if (is_us and show_ann_wht and not growth_wht.empty) else pd.Series(dtype=float, index=dates)
 
     # ----- figure layout -----
     fig = plt.figure(figsize=(18, 10))
     ax_left, ax_bottom, ax_width, ax_height = 0.10, 0.23, 0.80, 0.67
     ax_price = fig.add_axes([ax_left, ax_bottom, ax_width, ax_height])
 
-    # PRICE (red, LEFT base)
-    price_label = f"Price on Ex-Date ($ {cur})"
-    ax_price.plot(dates, price, color=RED, linewidth=2.2, label=price_label, zorder=3)
-    ax_price.set_ylabel(price_label, color=RED)
-    ax_price.tick_params(axis="y", colors=RED)
-    y0, y1 = mean_std_bounds(price, clamp_zero=True)
-    ax_price.set_ylim(y0, y1)
+    # PRICE
+    if show_price:
+        price_label = f"Price on Ex-Date ($ {cur})"
+        ax_price.plot(dates, price, color=RED, linewidth=2.2, label=price_label, zorder=3)
+        ax_price.set_ylabel(price_label, color=RED)
+        ax_price.tick_params(axis="y", colors=RED)
+        y0, y1 = mean_std_bounds(price, clamp_zero=True)
+        ax_price.set_ylim(y0, y1)
 
-    # DIVIDENDS (blue bars, left extra)
+    # DIVIDENDS
     ax_div_left = ax_price.twinx()
-    ax_div_left.spines.left.set_position(("axes", -0.18))
-    ax_div_left.spines.left.set_visible(True)
-    ax_div_left.yaxis.set_label_position("left")
-    ax_div_left.yaxis.tick_left()
-    ax_div_left.spines["left"].set_color(BLUE)
-    bar_w = compute_bar_width(dates)
-    ax_div_left.bar(dates, div, width=bar_w, alpha=0.35, color=BLUE, label="Dividends", align="center", zorder=2)
-    ax_div_left.set_ylabel("Dividends ($)", color=BLUE)
-    ax_div_left.tick_params(axis="y", colors=BLUE)
-    y0, y1 = mean_std_bounds(div, clamp_zero=True)
-    ax_div_left.set_ylim(y0, y1)
+    if show_dividends:
+        ax_div_left.spines.left.set_position(("axes", -0.18))
+        ax_div_left.spines.left.set_visible(True)
+        ax_div_left.yaxis.set_label_position("left")
+        ax_div_left.yaxis.tick_left()
+        ax_div_left.spines["left"].set_color(BLUE)
+        bar_w = compute_bar_width(dates)
+        ax_div_left.bar(dates, div, width=bar_w, alpha=0.35, color=BLUE, label="Dividends", align="center", zorder=2)
+        ax_div_left.set_ylabel("Dividends ($)", color=BLUE)
+        ax_div_left.tick_params(axis="y", colors=BLUE)
+        y0, y1 = mean_std_bounds(div, clamp_zero=True)
+        ax_div_left.set_ylim(y0, y1)
 
-    # GROWTH (green)
+    # GROWTH
     ax_growth = ax_price.twinx()
-    ax_growth.spines.left.set_position(("axes", -0.09))
-    ax_growth.spines.left.set_visible(True)
-    ax_growth.yaxis.set_label_position("left")
-    ax_growth.yaxis.tick_left()
-    ax_growth.spines["left"].set_color(GREEN)
-    ax_growth.plot(growth.index, growth.values, color=GREEN, linestyle="-", linewidth=2.6,
-                   label="Growth of $10,000", zorder=4)
-    if plot_taxed and not growth_wht.empty:
-        ax_growth.plot(growth_wht.index, growth_wht.values, color=GREEN, linestyle="-", linewidth=1.4,
-                       label="Growth of $10,000 (Less 15% US Witholding Tax)", zorder=4)
-    ax_growth.set_ylabel("Growth of $10,000", color=GREEN)
-    ax_growth.tick_params(axis="y", colors=GREEN)
-    y0, y1 = mean_std_bounds(pd.concat([growth, growth_wht]) if plot_taxed else growth, clamp_zero=True)
-    ax_growth.set_ylim(y0, y1)
+    if show_growth or (is_us and show_growth_wht):
+        ax_growth.spines.left.set_position(("axes", -0.09))
+        ax_growth.spines.left.set_visible(True)
+        ax_growth.yaxis.set_label_position("left")
+        ax_growth.yaxis.tick_left()
+        ax_growth.spines["left"].set_color(GREEN)
 
-    # TOTAL ANNUALIZED RETURN (%) (dark green dashed; USD-only taxed variant)
+        if show_growth and not growth.empty:
+            ax_growth.plot(growth.index, growth.values, color=GREEN, linestyle="-", linewidth=2.6,
+                           label="Growth of $10,000", zorder=4)
+
+        if is_us and show_growth_wht and not growth_wht.empty:
+            ax_growth.plot(growth_wht.index, growth_wht.values, color=GREEN, linestyle="-", linewidth=1.4,
+                           label="Growth of $10,000 (Less 15% US Witholding Tax)", zorder=4)
+
+        ax_growth.set_ylabel("Growth of $10,000", color=GREEN)
+        ax_growth.tick_params(axis="y", colors=GREEN)
+        to_scale = []
+        if show_growth and not growth.empty:
+            to_scale.append(growth)
+        if is_us and show_growth_wht and not growth_wht.empty:
+            to_scale.append(growth_wht)
+        if to_scale:
+            y0, y1 = mean_std_bounds(pd.concat(to_scale), clamp_zero=True)
+            ax_growth.set_ylim(y0, y1)
+
+    # TOTAL ANNUALIZED RETURN (%)
     ax_ann_right = ax_price.twinx()
-    ax_ann_right.spines.right.set_position(("axes", 1.05))
-    ax_ann_right.spines.right.set_visible(True)
-    ax_ann_right.spines["right"].set_color(ANN_GREEN)
-    if not ann.empty:
-        ax_ann_right.plot(ann.index, ann.values, color=ANN_GREEN, linestyle="--", linewidth=2.6,
-                          label="Total Annualized Return (%)", zorder=5)
-    if plot_taxed and not ann_wht.empty:
-        ax_ann_right.plot(ann_wht.index, ann_wht.values, color=ANN_GREEN, linestyle="--", linewidth=1.4, alpha=0.9,
-                          label="Total Annualized Return less 15% US Witholding Tax (%)", zorder=5)
-    ax_ann_right.set_ylabel("Total Annualized Return (%)", color=ANN_GREEN)
-    ax_ann_right.tick_params(axis="y", colors=ANN_GREEN)
-    if (not ann.empty) or (plot_taxed and not ann_wht.empty):
-        y0, y1 = mean_std_bounds(pd.concat([ann, ann_wht]) if plot_taxed else ann, clamp_zero=False)
-        ax_ann_right.set_ylim(y0, y1)
+    if show_ann or (is_us and show_ann_wht):
+        ax_ann_right.spines.right.set_position(("axes", 1.05))
+        ax_ann_right.spines.right.set_visible(True)
+        ax_ann_right.spines["right"].set_color(ANN_GREEN)
+        if show_ann and not ann.empty:
+            ax_ann_right.plot(ann.index, ann.values, color=ANN_GREEN, linestyle="--", linewidth=2.6,
+                              label="Total Annualized Return (%)", zorder=5)
+        if is_us and show_ann_wht and not ann_wht.empty:
+            ax_ann_right.plot(ann_wht.index, ann_wht.values, color=ANN_GREEN, linestyle="--", linewidth=1.4, alpha=0.9,
+                              label="Total Annualized Return less 15% US Witholding Tax (%)", zorder=5)
+        ax_ann_right.set_ylabel("Total Annualized Return (%)", color=ANN_GREEN)
+        ax_ann_right.tick_params(axis="y", colors=ANN_GREEN)
+        to_scale = []
+        if show_ann and not ann.empty:
+            to_scale.append(ann)
+        if is_us and show_ann_wht and not ann_wht.empty:
+            to_scale.append(ann_wht)
+        if to_scale:
+            y0, y1 = mean_std_bounds(pd.concat(to_scale), clamp_zero=False)
+            ax_ann_right.set_ylim(y0, y1)
 
-    # ANNUALIZED YIELD (%) (orange dashed)
+    # ANNUALIZED YIELD (%)
     ax_yld = ax_price.twinx()
-    ax_yld.spines.right.set_position(("axes", 1.12))
-    ax_yld.spines.right.set_visible(True)
-    ax_yld.spines["right"].set_color(DARK_ORANGE)
-    if n_finite > 0:
+    if show_yield and n_finite > 0:
+        ax_yld.spines.right.set_position(("axes", 1.12))
+        ax_yld.spines.right.set_visible(True)
+        ax_yld.spines["right"].set_color(DARK_ORANGE)
         x = dates.values
         y = yld_pct_series.values
         mask = np.isfinite(y)
@@ -413,10 +437,10 @@ def plot_distribution_analysis(ticker: str, outdir: Path, currency: str | None =
                     label="Annualized Yield (%)", zorder=6)
         y0, y1 = mean_std_bounds(pd.Series(y[mask], index=dates[mask]), clamp_zero=True)
         ax_yld.set_ylim(y0, y1)
-    else:
+        ax_yld.set_ylabel("Annualized Yield (%)", color=DARK_ORANGE)
+        ax_yld.tick_params(axis="y", colors=DARK_ORANGE)
+    elif show_yield:
         print(f"[WARN] No finite annualized yield points for {symbol} — skipping yield plot.")
-    ax_yld.set_ylabel("Annualized Yield (%)", color=DARK_ORANGE)
-    ax_yld.tick_params(axis="y", colors=DARK_ORANGE)
 
     # Title / x-axis / limits
     ax_price.set_title(f"{symbol} Distribution Analysis", fontsize=16)
@@ -439,7 +463,7 @@ def plot_distribution_analysis(ticker: str, outdir: Path, currency: str | None =
     if handles:
         fig.legend(handles, labels, loc="lower center", bbox_to_anchor=(0.5, 0.06), ncol=2, frameon=False)
 
-    # Save (filename uses dash for portability)
+    # Save
     plt.savefig(out_path, dpi=190, bbox_inches="tight")
     plt.close(fig)
     print(f"Wrote: {out_path}")
@@ -452,8 +476,31 @@ def main():
     ap.add_argument("--outdir", default="graphs", help="Output directory for PNG (default: graphs)")
     ap.add_argument("--currency", choices=["USD", "CAD"], help="Force which history CSV to read (USD or CAD)")
     ap.add_argument("--force", action="store_true", help="Force re-plot even if existing PNG is up-to-date")
+
+    # Series toggles: default OFF — only plotted if explicitly enabled by flags (workflows pass these)
+    boolopt = argparse.BooleanOptionalAction
+    ap.add_argument("--price", dest="show_price", action=boolopt, default=False, help="Show Price on Ex-Date")
+    ap.add_argument("--dividends", dest="show_dividends", action=boolopt, default=False, help="Show Dividends")
+    ap.add_argument("--growth", dest="show_growth", action=boolopt, default=False, help="Show Growth of $10,000")
+    ap.add_argument("--growth-wht", dest="show_growth_wht", action=boolopt, default=False, help="Show Growth of $10,000 (Less 15% US WHT) [USD only]")
+    ap.add_argument("--ann", dest="show_ann", action=boolopt, default=False, help="Show Total Annualized Return (starts after 12 months)")
+    ap.add_argument("--ann-wht", dest="show_ann_wht", action=boolopt, default=False, help="Show Annualized Return (Less 15% US WHT) [USD only]")
+    ap.add_argument("--yield", dest="show_yield", action=boolopt, default=False, help="Show Annualized Yield (%) from CSV")
+
     args = ap.parse_args()
-    plot_distribution_analysis(args.ticker, Path(args.outdir), currency=args.currency, force=args.force)
+    plot_distribution_analysis(
+        args.ticker,
+        Path(args.outdir),
+        currency=args.currency,
+        force=args.force,
+        show_price=args.show_price,
+        show_dividends=args.show_dividends,
+        show_growth=args.show_growth,
+        show_growth_wht=args.show_growth_wht,
+        show_ann=args.show_ann,
+        show_ann_wht=args.show_ann_wht,
+        show_yield=args.show_yield,
+    )
 
 if __name__ == "__main__":
     main()
