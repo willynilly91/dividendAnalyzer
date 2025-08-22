@@ -6,9 +6,9 @@ Generates a chart for a single ticker showing:
   - Price on Ex-Date ($ <currency>)  ........ red line (LEFT base axis)
   - Dividends ($) ............................ blue bars (LEFT extra axis)
   - Growth of $10,000 ........................ green solid (LEFT extra axis, bold)
-  - Growth of $10,000 (Less 15% US Witholding Tax) ... green solid (LEFT extra axis, thin)
-  - Total Annualized Return (%) .............. darkened light-green dashed (RIGHT extra axis, bold; starts after >=6 months)
-  - Total Annualized Return less 15% US Witholding Tax (%) ... darkened light-green dashed (RIGHT extra axis, thin; starts after >=6 months)
+  - Growth of $10,000 (Less 15% US Witholding Tax) ... green solid (LEFT extra axis, thin)  [USD only]
+  - Total Annualized Return (%) .............. darkened light-green dashed (RIGHT extra axis, bold; starts after >=12 months)
+  - Total Annualized Return less 15% US Witholding Tax (%) ... darkened light-green dashed (RIGHT extra axis, thin; starts after >=12 months) [USD only]
   - Annualized Yield (%) ..................... dark orange dashed (RIGHT extra axis)  ← from CSV
 
 Quality-of-life:
@@ -23,7 +23,6 @@ Quality-of-life:
 from __future__ import annotations
 import argparse
 import math
-import re
 import datetime as dt
 from pathlib import Path
 
@@ -59,69 +58,47 @@ def _trim_dollar(sym: str) -> str:
     return sym[1:] if sym.startswith("$") else sym
 
 def _to_dot_suffix(sym: str) -> str:
-    """Convert trailing -TO/-NE/-V/-CN to .TO/.NE/.V/.CN; keep internal hyphens (e.g., EIT-UN.TO)."""
-    s = sym
     for dash, dot in zip(CA_SUFFIXES_DASH, CA_SUFFIXES_DOT):
-        if s.endswith(dash):
-            return s[: -len(dash)] + dot
-    return s
+        if sym.endswith(dash):
+            return sym[: -len(dash)] + dot
+    return sym
 
 def _to_dash_suffix(sym: str) -> str:
-    """Convert trailing .TO/.NE/.V/.CN to -TO/-NE/-V/-CN; keep internal hyphens unchanged."""
-    s = sym
     for dot, dash in zip(CA_SUFFIXES_DOT, CA_SUFFIXES_DASH):
-        if s.endswith(dot):
-            return s[: -len(dot)] + dash
-    return s
+        if sym.endswith(dot):
+            return sym[: -len(dot)] + dash
+    return sym
 
 def _maybe_add_dot_ca_suffix(sym: str) -> str:
-    """If no Canadian suffix present (dot or dash) and no US suffix, assume .TO."""
     if sym.endswith(CA_SUFFIXES_DOT) or sym.endswith(CA_SUFFIXES_DASH):
         return sym
-    # If symbol already looks like US (no suffix), leave as-is
     return sym + ".TO"
 
 def _symbol_variants(user_input: str) -> list[str]:
-    """
-    Generate robust matching variants for a given input:
-      1) Uppercased, prefixes removed, $ stripped
-      2) Dot-suffix form (Yahoo), e.g. HYLD.TO
-      3) Dash-suffix form, e.g. HYLD-TO
-      4) If no CA suffix was present, also add inferred .TO and -TO
-    """
     base = _trim_dollar(_strip_prefixes(user_input)).upper()
-
     variants = []
-    # If already has dot or dash CA suffix, produce both forms
     if base.endswith(CA_SUFFIXES_DOT) or base.endswith(CA_SUFFIXES_DASH):
         dot  = _to_dot_suffix(base)
         dash = _to_dash_suffix(base)
         variants.extend([dot, dash])
     else:
-        # No CA suffix: include original, plus inferred .TO / -TO
         variants.append(base)
         dot_inf  = _maybe_add_dot_ca_suffix(base)
         dash_inf = _to_dash_suffix(dot_inf)
         variants.extend([dot_inf, dash_inf])
-
-    # De-duplicate while preserving order
-    seen = set()
-    uniq = []
+    seen, uniq = set(), []
     for v in variants:
         if v not in seen:
-            seen.add(v)
-            uniq.append(v)
+            seen.add(v); uniq.append(v)
     return uniq
 
 def _yahoo_symbol(sym: str) -> str:
-    """Best-effort Yahoo Finance form: ensure DOT suffix for CA; keep internal hyphens."""
     s = _trim_dollar(_strip_prefixes(sym)).upper()
     if s.endswith(CA_SUFFIXES_DOT):
         return s
     if s.endswith(CA_SUFFIXES_DASH):
         return _to_dot_suffix(s)
-    # if no suffix, return as-is (US)
-    return s
+    return s  # US
 
 def infer_currency_from_symbol(sym: str) -> str:
     s = sym.upper()
@@ -147,7 +124,6 @@ def _read_histories(currency: str | None = None) -> pd.DataFrame:
     if not needed.issubset(df.columns):
         raise SystemExit("Historical CSV missing required columns: 'Ticker' and 'Ex-Div Date'.")
 
-    # Coerce types
     df["Ex-Div Date"] = pd.to_datetime(df["Ex-Div Date"], errors="coerce")
     for c in ("Dividend", "Price on Ex-Date", "Annualized Yield"):
         if c in df.columns:
@@ -204,7 +180,8 @@ def growth_series(dates: pd.Series, price: pd.Series, div: pd.Series, div_factor
             vals.append(vals[-1])
     return pd.Series(vals, index=dates)
 
-def annualized_return_series(growth_path: pd.Series) -> pd.Series:
+def annualized_return_series(growth_path: pd.Series, min_days: int = 365) -> pd.Series:
+    """Inception-to-date annualized %; start after >= min_days (default 365)."""
     out = pd.Series(index=growth_path.index, dtype=float)
     if growth_path.empty:
         return out.dropna()
@@ -212,7 +189,7 @@ def annualized_return_series(growth_path: pd.Series) -> pd.Series:
     start_val = 10000.0
     for d, v in growth_path.items():
         days = (d - start_date).days
-        if days >= 182 and v > 0:
+        if days >= min_days and v > 0:
             out.loc[d] = ((v / start_val) ** (365.0 / days) - 1.0) * 100.0
     return out.dropna()
 
@@ -273,35 +250,21 @@ def _ensure_history_now(symbol_for_yahoo: str, currency: str) -> None:
     history_updater.ensure_history([symbol_for_yahoo], hist_path)
 
 def _bootstrap_if_missing(hist_all: pd.DataFrame, user_input: str, currency: str) -> tuple[pd.DataFrame, str]:
-    """
-    If nothing found for the input, add DOT-form to list, scrape, and reload.
-    Returns (reloaded_df, chosen_symbol_to_plot)
-    """
     variants = _symbol_variants(user_input)
-    # If any variant already exists in df, return as-is with that symbol
     for v in variants:
         df = hist_all[hist_all["Ticker"].astype(str) == v]
         if not df.empty:
             return hist_all, v
-
-    # Decide Yahoo/dot symbol & list file
     yahoo = _yahoo_symbol(user_input)
     list_file = LIST_CA if currency.upper() == "CAD" else LIST_US
     _append_unique_line(list_file, yahoo)
-
-    # Scrape into appropriate CSV
     _ensure_history_now(yahoo, currency)
-
-    # Reload histories for this currency
     reloaded = _read_histories(currency=currency)
-
-    # After reload, prefer exact yahoo (dot) match, else any variant
     if not reloaded[reloaded["Ticker"].astype(str) == yahoo].empty:
         return reloaded, yahoo
     for v in _symbol_variants(yahoo):
-        if not reloaded[reloaded["Ticker"].astype(str) == v].empty:
+        if not reloaded[reloaded["Ticker"].astype[str] == v].empty:
             return reloaded, v
-
     raise SystemExit(f"Failed to bootstrap history for {yahoo} ({currency}).")
 
 # ---------- main plotting ----------
@@ -309,7 +272,7 @@ def plot_distribution_analysis(ticker: str, outdir: Path, currency: str | None =
     cur = (currency or "").upper().strip() or None
     hist = _read_histories(currency=cur)
 
-    # Try all variants to find existing rows
+    # Try variants to find rows
     candidates = _symbol_variants(ticker)
     chosen = None
     for sym in candidates:
@@ -318,7 +281,6 @@ def plot_distribution_analysis(ticker: str, outdir: Path, currency: str | None =
             chosen = sym
             break
 
-    # If none found, bootstrap now
     if chosen is None:
         if cur is None:
             cur = infer_currency_from_symbol(ticker)
@@ -334,11 +296,9 @@ def plot_distribution_analysis(ticker: str, outdir: Path, currency: str | None =
     if df.empty:
         raise SystemExit(f"No valid Ex-Div Date rows for {symbol}")
 
-    # Establish output path early for freshness check
+    # Output path & freshness
     outdir.mkdir(parents=True, exist_ok=True)
-    out_path = outdir / f"{symbol.replace('.', '-')}_distribution_analysis.png"  # keep filenames consistent
-
-    # Freshness check
+    out_path = outdir / f"{symbol.replace('.', '-')}_distribution_analysis.png"
     latest_date = _latest_data_date(df)
     if not force and _is_plot_up_to_date(out_path, latest_date):
         print(f"[SKIP] {symbol}: plot is up-to-date (PNG date >= latest data date: {latest_date}).")
@@ -348,7 +308,7 @@ def plot_distribution_analysis(ticker: str, outdir: Path, currency: str | None =
     price = df["Price on Ex-Date"].astype(float)
     div = df["Dividend"].astype(float).fillna(0.0)
 
-    # Currency from CSV if available; else infer from symbol
+    # Currency from CSV if available; else infer from symbol / arg
     if "Currency" in df.columns and df["Currency"].notna().any():
         cur_from_csv = df["Currency"].dropna().iloc[-1]
         if cur_from_csv in ("USD", "CAD"):
@@ -356,7 +316,7 @@ def plot_distribution_analysis(ticker: str, outdir: Path, currency: str | None =
     if not cur:
         cur = infer_currency_from_symbol(symbol)
 
-    # Annualized Yield (%) straight from CSV
+    # Annualized Yield (%) from CSV
     yld_pct_series = _annualized_yield_percent(df)
 
     # Diagnostics
@@ -367,11 +327,17 @@ def plot_distribution_analysis(ticker: str, outdir: Path, currency: str | None =
 
     # Growth paths
     growth = growth_series(dates, price, div, div_factor=1.0)
-    growth_wht = growth_series(dates, price, div, div_factor=0.85)
 
-    # Annualized %
-    ann = annualized_return_series(growth)
-    ann_wht = annualized_return_series(growth_wht)
+    # USD-only taxed growth
+    plot_taxed = (cur == "USD")
+    if plot_taxed:
+        growth_wht = growth_series(dates, price, div, div_factor=0.85)
+    else:
+        growth_wht = pd.Series(dtype=float, index=dates)
+
+    # Annualized % (start after >= 12 months)
+    ann = annualized_return_series(growth, min_days=365)
+    ann_wht = annualized_return_series(growth_wht, min_days=365) if plot_taxed else pd.Series(dtype=float, index=dates)
 
     # ----- figure layout -----
     fig = plt.figure(figsize=(18, 10))
@@ -407,26 +373,31 @@ def plot_distribution_analysis(ticker: str, outdir: Path, currency: str | None =
     ax_growth.yaxis.set_label_position("left")
     ax_growth.yaxis.tick_left()
     ax_growth.spines["left"].set_color(GREEN)
-    ax_growth.plot(growth.index, growth.values, color=GREEN, linestyle="-", linewidth=2.6, label="Growth of $10,000", zorder=4)
-    ax_growth.plot(growth_wht.index, growth_wht.values, color=GREEN, linestyle="-", linewidth=1.4, label="Growth of $10,000 (Less 15% US Witholding Tax)", zorder=4)
+    ax_growth.plot(growth.index, growth.values, color=GREEN, linestyle="-", linewidth=2.6,
+                   label="Growth of $10,000", zorder=4)
+    if plot_taxed and not growth_wht.empty:
+        ax_growth.plot(growth_wht.index, growth_wht.values, color=GREEN, linestyle="-", linewidth=1.4,
+                       label="Growth of $10,000 (Less 15% US Witholding Tax)", zorder=4)
     ax_growth.set_ylabel("Growth of $10,000", color=GREEN)
     ax_growth.tick_params(axis="y", colors=GREEN)
-    y0, y1 = mean_std_bounds(pd.concat([growth, growth_wht]), clamp_zero=True)
+    y0, y1 = mean_std_bounds(pd.concat([growth, growth_wht]) if plot_taxed else growth, clamp_zero=True)
     ax_growth.set_ylim(y0, y1)
 
-    # TOTAL ANNUALIZED RETURN (%) (dark green dashed)
+    # TOTAL ANNUALIZED RETURN (%) (dark green dashed; USD-only taxed variant)
     ax_ann_right = ax_price.twinx()
     ax_ann_right.spines.right.set_position(("axes", 1.05))
     ax_ann_right.spines.right.set_visible(True)
     ax_ann_right.spines["right"].set_color(ANN_GREEN)
     if not ann.empty:
-        ax_ann_right.plot(ann.index, ann.values, color=ANN_GREEN, linestyle="--", linewidth=2.6, label="Total Annualized Return (%)", zorder=5)
-    if not ann_wht.empty:
-        ax_ann_right.plot(ann_wht.index, ann_wht.values, color=ANN_GREEN, linestyle="--", linewidth=1.4, alpha=0.9, label="Total Annualized Return less 15% US Witholding Tax (%)", zorder=5)
+        ax_ann_right.plot(ann.index, ann.values, color=ANN_GREEN, linestyle="--", linewidth=2.6,
+                          label="Total Annualized Return (%)", zorder=5)
+    if plot_taxed and not ann_wht.empty:
+        ax_ann_right.plot(ann_wht.index, ann_wht.values, color=ANN_GREEN, linestyle="--", linewidth=1.4, alpha=0.9,
+                          label="Total Annualized Return less 15% US Witholding Tax (%)", zorder=5)
     ax_ann_right.set_ylabel("Total Annualized Return (%)", color=ANN_GREEN)
     ax_ann_right.tick_params(axis="y", colors=ANN_GREEN)
-    if not ann.empty or not ann_wht.empty:
-        y0, y1 = mean_std_bounds(pd.concat([ann, ann_wht]), clamp_zero=False)
+    if (not ann.empty) or (plot_taxed and not ann_wht.empty):
+        y0, y1 = mean_std_bounds(pd.concat([ann, ann_wht]) if plot_taxed else ann, clamp_zero=False)
         ax_ann_right.set_ylim(y0, y1)
 
     # ANNUALIZED YIELD (%) (orange dashed)
@@ -438,7 +409,8 @@ def plot_distribution_analysis(ticker: str, outdir: Path, currency: str | None =
         x = dates.values
         y = yld_pct_series.values
         mask = np.isfinite(y)
-        ax_yld.plot(x[mask], y[mask], color=DARK_ORANGE, linestyle="--", linewidth=2.0, label="Annualized Yield (%)", zorder=6)
+        ax_yld.plot(x[mask], y[mask], color=DARK_ORANGE, linestyle="--", linewidth=2.0,
+                    label="Annualized Yield (%)", zorder=6)
         y0, y1 = mean_std_bounds(pd.Series(y[mask], index=dates[mask]), clamp_zero=True)
         ax_yld.set_ylim(y0, y1)
     else:
@@ -468,7 +440,6 @@ def plot_distribution_analysis(ticker: str, outdir: Path, currency: str | None =
         fig.legend(handles, labels, loc="lower center", bbox_to_anchor=(0.5, 0.06), ncol=2, frameon=False)
 
     # Save (filename uses dash for portability)
-    out_path = outdir / f"{symbol.replace('.', '-')}_distribution_analysis.png"
     plt.savefig(out_path, dpi=190, bbox_inches="tight")
     plt.close(fig)
     print(f"Wrote: {out_path}")
