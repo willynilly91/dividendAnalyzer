@@ -9,17 +9,19 @@ Generates a chart for a single ticker showing:
   - Growth of $10,000 (Less 15% US Witholding Tax) ... green solid (LEFT extra axis, thin)
   - Total Annualized Return (%) .............. darkened light-green dashed (RIGHT extra axis, bold; starts after >=6 months)
   - Total Annualized Return less 15% US Witholding Tax (%) ... darkened light-green dashed (RIGHT extra axis, thin; starts after >=6 months)
-  - Yield on Ex-Date Price (%) ............... dark orange dashed (RIGHT extra axis)
+  - Annualized Yield (%) ..................... dark orange dashed (RIGHT extra axis)  ← now sourced from CSV
 
 Inputs (event-style history produced by your pipeline):
   - historical_etf_yields_us.csv
   - historical_etf_yields_canada.csv
 
 Required columns: "Ticker","Ex-Div Date","Dividend","Price on Ex-Date"
-Optional column:  "Currency" (USD/CAD)  ← used for axis/legend label if present
+Optional columns:
+  - "Annualized Yield" (decimal or percent; auto-detected)
+  - "Currency" (USD/CAD)  ← used for axis/legend label if present
 
 Usage:
-  python plot_ticker_graph.py <TICKER> [--outdir graphs]
+  python plot_ticker_graph.py <TICKER> [--outdir graphs] [--currency USD|CAD]
 """
 
 from __future__ import annotations
@@ -68,16 +70,25 @@ def infer_currency_from_symbol(s: str) -> str:
     return "CAD" if s.upper().endswith(CA_SUFFIXES) else "USD"
 
 # ---------- IO ----------
-def _read_histories() -> pd.DataFrame:
+def _read_histories(currency: str | None = None) -> pd.DataFrame:
+    """
+    Load the correct historical CSV(s).
+    If currency is provided ('USD' or 'CAD'), only read that one.
+    Otherwise, read both (backwards compatible behavior).
+    """
     frames = []
-    for p in (HIST_CA, HIST_US):
-        if p.exists():
-            try:
+    if currency:
+        cur = currency.strip().upper()
+        pick = HIST_CA if cur == "CAD" else HIST_US
+        if pick.exists():
+            frames.append(pd.read_csv(pick))
+    else:
+        for p in (HIST_CA, HIST_US):
+            if p.exists():
                 frames.append(pd.read_csv(p))
-            except Exception:
-                pass
     if not frames:
         raise SystemExit("No historical CSV found. Expected historical_etf_yields_us.csv and/or historical_etf_yields_canada.csv")
+
     df = pd.concat(frames, ignore_index=True)
 
     needed = {"Ticker", "Ex-Div Date"}
@@ -86,7 +97,7 @@ def _read_histories() -> pd.DataFrame:
 
     # Coerce types
     df["Ex-Div Date"] = pd.to_datetime(df["Ex-Div Date"], errors="coerce")
-    for c in ("Dividend", "Price on Ex-Date"):
+    for c in ("Dividend", "Price on Ex-Date", "Annualized Yield"):
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce")
     # Normalize Currency if present
@@ -152,9 +163,27 @@ def annualized_return_series(growth_path: pd.Series) -> pd.Series:
             out.loc[d] = ((v / start_val) ** (365.0 / days) - 1.0) * 100.0
     return out.dropna()
 
+# ---------- Annualized Yield helper (from CSV) ----------
+def _annualized_yield_percent(df_sel: pd.DataFrame) -> pd.Series:
+    """
+    Return Annualized Yield as a % series on the same index as df_sel['Ex-Div Date'].
+    Auto-detect units:
+      - if median > 1.5, assume it's already % (e.g., 85 == 85%)
+      - else assume decimal (e.g., 0.85) and multiply by 100
+    """
+    if "Annualized Yield" not in df_sel.columns:
+        return pd.Series(dtype=float, index=df_sel["Ex-Div Date"])
+    s = pd.to_numeric(df_sel["Annualized Yield"], errors="coerce")
+    s_nonnull = s.dropna()
+    if s_nonnull.empty:
+        return pd.Series(dtype=float, index=df_sel["Ex-Div Date"])
+    med = float(np.nanmedian(s_nonnull))
+    y_pct = s if med > 1.5 else (s * 100.0)
+    return pd.Series(y_pct.values, index=df_sel["Ex-Div Date"], dtype=float)
+
 # ---------- main plotting ----------
-def plot_distribution_analysis(ticker: str, outdir: Path) -> Path:
-    hist = _read_histories()
+def plot_distribution_analysis(ticker: str, outdir: Path, currency: str | None = None) -> Path:
+    hist = _read_histories(currency=currency)
 
     # Normalize ticker & attempt CA fallback
     base = normalize_symbol(ticker)
@@ -186,17 +215,14 @@ def plot_distribution_analysis(ticker: str, outdir: Path) -> Path:
     else:
         cur = infer_currency_from_symbol(symbol)
 
-    # Absolute yield (%), robust to missing/zero price or dividend
-    with np.errstate(divide="ignore", invalid="ignore"):
-        yld_raw = div / price
-    yld_pct_series = (yld_raw * 100.0).replace([np.inf, -np.inf], np.nan)
-    yld_pct_series = pd.Series(yld_pct_series.values, index=dates, dtype=float)
+    # Annualized Yield (%) straight from CSV (auto decimal/percent handling)
+    yld_pct_series = _annualized_yield_percent(df)
 
-    # Diagnostics help when yield “disappears”
+    # Diagnostics help
     finite_mask = np.isfinite(yld_pct_series.values)
     n_total = len(yld_pct_series)
     n_finite = int(np.sum(finite_mask))
-    print(f"[INFO] Yield points for {symbol}: total={n_total}, finite={n_finite}, zeros_div={int((div==0).sum())}, zeros_price={int((price==0).sum())}")
+    print(f"[INFO] Annualized Yield points for {symbol}: total={n_total}, finite={n_finite}")
 
     # Growth paths
     growth = growth_series(dates, price, div, div_factor=1.0)
@@ -220,7 +246,7 @@ def plot_distribution_analysis(ticker: str, outdir: Path) -> Path:
     y0, y1 = mean_std_bounds(price, clamp_zero=True)
     ax_price.set_ylim(y0, y1)
 
-    # DIVIDENDS ($) — now on a LEFT extra axis (blue bars)
+    # DIVIDENDS ($) — LEFT extra axis (blue bars)
     ax_div_left = ax_price.twinx()
     ax_div_left.spines.left.set_position(("axes", -0.18))  # farther left than growth axis
     ax_div_left.spines.left.set_visible(True)
@@ -267,7 +293,7 @@ def plot_distribution_analysis(ticker: str, outdir: Path) -> Path:
         y0, y1 = mean_std_bounds(pd.concat([ann, ann_wht]), clamp_zero=False)
         ax_ann_right.set_ylim(y0, y1)
 
-    # YIELD on Ex-Date Price (%) — RIGHT extra axis (dark orange, dashed)
+    # ANNUALIZED YIELD (%) — RIGHT extra axis (dark orange, dashed)
     ax_yld = ax_price.twinx()
     ax_yld.spines.right.set_position(("axes", 1.12))  # outside ann axis
     ax_yld.spines.right.set_visible(True)
@@ -277,12 +303,12 @@ def plot_distribution_analysis(ticker: str, outdir: Path) -> Path:
         y = yld_pct_series.values
         mask = np.isfinite(y)
         ax_yld.plot(x[mask], y[mask], color=DARK_ORANGE, linestyle="--", linewidth=2.0,
-                    label="Yield on Ex-Date Price (%)", zorder=6)
+                    label="Annualized Yield (%)", zorder=6)
         y0, y1 = mean_std_bounds(pd.Series(y[mask], index=dates[mask]), clamp_zero=True)
         ax_yld.set_ylim(y0, y1)
     else:
-        print(f"[WARN] No finite yield points for {symbol} — skipping yield plot.")
-    ax_yld.set_ylabel("Yield on Ex-Date Price (%)", color=DARK_ORANGE)
+        print(f"[WARN] No finite annualized yield points for {symbol} — skipping yield plot.")
+    ax_yld.set_ylabel("Annualized Yield (%)", color=DARK_ORANGE)
     ax_yld.tick_params(axis="y", colors=DARK_ORANGE)
 
     # Title, x-axis label, x-limits
@@ -319,8 +345,9 @@ def main():
     ap = argparse.ArgumentParser(description="Plot distribution analysis for a single ticker from historical event CSVs.")
     ap.add_argument("ticker", help="Ticker symbol (e.g., ULTY or TSX:ZAG)")
     ap.add_argument("--outdir", default="graphs", help="Output directory for PNG (default: graphs)")
+    ap.add_argument("--currency", choices=["USD", "CAD"], help="Force which history CSV to read (USD or CAD)")
     args = ap.parse_args()
-    plot_distribution_analysis(args.ticker, Path(args.outdir))
+    plot_distribution_analysis(args.ticker, Path(args.outdir), currency=args.currency)
 
 if __name__ == "__main__":
     main()
