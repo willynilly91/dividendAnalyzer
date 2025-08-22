@@ -52,18 +52,26 @@ jobs:
           fi
 
       - name: Generate graph
+        shell: bash
         env:
-          FORCE: ${{ github.event.inputs.force_replot }}
+          FORCE_INPUT: ${{ github.event.inputs.force_replot }}
         run: |
+          set -euo pipefail
           mkdir -p "${{ github.event.inputs.outdir }}"
-          if [ "$FORCE" = "yes" ]; then
+
+          # Case-insensitive evaluation of the force toggle
+          FORCE_LC="${FORCE_INPUT,,}"
+          if [[ "$FORCE_LC" == "yes" || "$FORCE_LC" == "true" ]]; then
             FORCE_FLAG="--force"
           else
             FORCE_FLAG=""
           fi
+          echo "Force input: '${FORCE_INPUT}' -> passing flag: '${FORCE_FLAG}'"
+
           python plot_ticker_graph.py "${{ github.event.inputs.ticker }}" \
             --currency "${{ github.event.inputs.currency }}" \
-            --outdir "${{ github.event.inputs.outdir }}" $FORCE_FLAG
+            --outdir "${{ github.event.inputs.outdir }}" \
+            $FORCE_FLAG
 
       - name: List outputs
         run: |
@@ -76,5 +84,5 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add -f "${{ github.event.inputs.outdir }}"/*.png || true
           git add -f us_tickers.txt ca_tickers.txt || true
-          git commit -m "Graph for ${{ github.event.inputs.ticker }} (${{ github.event.inputs.currency }})" || echo "Nothing to commit"
+          git commit -m "Graph for ${{ github.event.inputs.ticker }} (${{ github.event.inputs.currency }}) [force=${{ github.event.inputs.force_replot }}]" || echo "Nothing to commit"
           git push || true
