@@ -9,7 +9,7 @@ Generates a chart for a single ticker showing:
   - Growth of $10,000 (Less 15% US Witholding Tax) ... green solid (LEFT extra axis, thin)
   - Total Annualized Return (%) .............. darkened light-green dashed (RIGHT extra axis, bold; starts after >=6 months)
   - Total Annualized Return less 15% US Witholding Tax (%) ... darkened light-green dashed (RIGHT extra axis, thin; starts after >=6 months)
-  - Annualized Yield (%) ..................... dark orange dashed (RIGHT extra axis)  ← now sourced from CSV
+  - Annualized Yield (%) ..................... dark orange dashed (RIGHT extra axis)  ← from CSV
 
 Inputs (event-style history produced by your pipeline):
   - historical_etf_yields_us.csv
@@ -18,10 +18,11 @@ Inputs (event-style history produced by your pipeline):
 Required columns: "Ticker","Ex-Div Date","Dividend","Price on Ex-Date"
 Optional columns:
   - "Annualized Yield" (decimal or percent; auto-detected)
-  - "Currency" (USD/CAD)  ← used for axis/legend label if present
+  - "Currency" (USD/CAD)
+  - "Scraped At Date" (YYYY-MM-DD)  ← used for freshness checks
 
 Usage:
-  python plot_ticker_graph.py <TICKER> [--outdir graphs] [--currency USD|CAD]
+  python plot_ticker_graph.py <TICKER> [--outdir graphs] [--currency USD|CAD] [--force]
 """
 
 from __future__ import annotations
@@ -104,6 +105,12 @@ def _read_histories(currency: str | None = None) -> pd.DataFrame:
     if "Currency" in df.columns:
         df["Currency"] = df["Currency"].astype(str).str.strip().str.upper()
         df.loc[~df["Currency"].isin(["USD", "CAD"]), "Currency"] = np.nan
+
+    # Normalize Scraped At Date if present
+    if "Scraped At Date" in df.columns:
+        # Parse as date; keep tz-naive
+        df["Scraped At Date"] = pd.to_datetime(df["Scraped At Date"], errors="coerce").dt.normalize()
+
     return df
 
 # ---------- scaling ----------
@@ -181,8 +188,39 @@ def _annualized_yield_percent(df_sel: pd.DataFrame) -> pd.Series:
     y_pct = s if med > 1.5 else (s * 100.0)
     return pd.Series(y_pct.values, index=df_sel["Ex-Div Date"], dtype=float)
 
+# ---------- freshness / skip logic ----------
+def _latest_data_timestamp(df_sel: pd.DataFrame) -> dt.datetime:
+    """
+    Determine the freshest timestamp present in the selected rows.
+    Prefer Scraped At Date (if present), otherwise Ex-Div Date.
+    Returns a timezone-naive UTC-ish datetime at end-of-day to be conservative.
+    """
+    candidates: list[pd.Timestamp] = []
+    if "Scraped At Date" in df_sel.columns:
+        s = pd.to_datetime(df_sel["Scraped At Date"], errors="coerce")
+        s = s.dropna()
+        if not s.empty:
+            candidates.append(s.max())
+    # Always consider Ex-Div Date
+    ex = pd.to_datetime(df_sel["Ex-Div Date"], errors="coerce").dropna()
+    if not ex.empty:
+        candidates.append(ex.max())
+    if not candidates:
+        # Fallback: epoch 0 to force plotting
+        return dt.datetime(1970, 1, 1)
+    latest = max(candidates).to_pydatetime()
+    # compare on end-of-day to avoid same-day false skips
+    return dt.datetime.combine(latest.date(), dt.time(23, 59, 59))
+
+def _is_plot_up_to_date(out_path: Path, latest_ts: dt.datetime) -> bool:
+    """Return True if the PNG exists and its mtime is >= latest_ts."""
+    if not out_path.exists():
+        return False
+    mtime = dt.datetime.utcfromtimestamp(out_path.stat().st_mtime)
+    return mtime >= latest_ts
+
 # ---------- main plotting ----------
-def plot_distribution_analysis(ticker: str, outdir: Path, currency: str | None = None) -> Path:
+def plot_distribution_analysis(ticker: str, outdir: Path, currency: str | None = None, force: bool = False) -> Path | None:
     hist = _read_histories(currency=currency)
 
     # Normalize ticker & attempt CA fallback
@@ -203,6 +241,16 @@ def plot_distribution_analysis(ticker: str, outdir: Path, currency: str | None =
     if df.empty:
         raise SystemExit(f"No valid Ex-Div Date rows for {symbol}")
 
+    # Establish output path early for freshness check
+    outdir.mkdir(parents=True, exist_ok=True)
+    out_path = outdir / f"{symbol}_distribution_analysis.png"
+
+    # Freshness check: skip if up-to-date (unless --force)
+    latest_ts = _latest_data_timestamp(df)
+    if not force and _is_plot_up_to_date(out_path, latest_ts):
+        print(f"[SKIP] {symbol}: plot is up-to-date (PNG mtime >= latest data: {latest_ts.date()}).")
+        return None
+
     dates = df["Ex-Div Date"]
     price = df["Price on Ex-Date"].astype(float)
     div = df["Dividend"].astype(float).fillna(0.0)
@@ -218,7 +266,7 @@ def plot_distribution_analysis(ticker: str, outdir: Path, currency: str | None =
     # Annualized Yield (%) straight from CSV (auto decimal/percent handling)
     yld_pct_series = _annualized_yield_percent(df)
 
-    # Diagnostics help
+    # Diagnostics
     finite_mask = np.isfinite(yld_pct_series.values)
     n_total = len(yld_pct_series)
     n_finite = int(np.sum(finite_mask))
@@ -333,8 +381,6 @@ def plot_distribution_analysis(ticker: str, outdir: Path, currency: str | None =
         fig.legend(handles, labels, loc="lower center", bbox_to_anchor=(0.5, 0.06), ncol=2, frameon=False)
 
     # Save
-    outdir.mkdir(parents=True, exist_ok=True)
-    out_path = outdir / f"{symbol}_distribution_analysis.png"
     plt.savefig(out_path, dpi=190, bbox_inches="tight")
     plt.close(fig)
     print(f"Wrote: {out_path}")
@@ -346,8 +392,9 @@ def main():
     ap.add_argument("ticker", help="Ticker symbol (e.g., ULTY or TSX:ZAG)")
     ap.add_argument("--outdir", default="graphs", help="Output directory for PNG (default: graphs)")
     ap.add_argument("--currency", choices=["USD", "CAD"], help="Force which history CSV to read (USD or CAD)")
+    ap.add_argument("--force", action="store_true", help="Force re-plot even if existing PNG is up-to-date")
     args = ap.parse_args()
-    plot_distribution_analysis(args.ticker, Path(args.outdir), currency=args.currency)
+    plot_distribution_analysis(args.ticker, Path(args.outdir), currency=args.currency, force=args.force)
 
 if __name__ == "__main__":
     main()
