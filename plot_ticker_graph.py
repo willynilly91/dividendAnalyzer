@@ -16,7 +16,7 @@ Inputs (event-style history produced by your pipeline):
   - historical_etf_yields_canada.csv
 
 Required columns: "Ticker","Ex-Div Date","Dividend","Price on Ex-Date"
-Optional column:  "Currency" (USD/CAD)  ← used for axis label if present
+Optional column:  "Currency" (USD/CAD)  ← used for axis/legend label if present
 
 Usage:
   python plot_ticker_graph.py <TICKER> [--outdir graphs]
@@ -186,11 +186,17 @@ def plot_distribution_analysis(ticker: str, outdir: Path) -> Path:
     else:
         cur = infer_currency_from_symbol(symbol)
 
-    # Absolute yield (%)
+    # Absolute yield (%), robust to missing/zero price or dividend
     with np.errstate(divide="ignore", invalid="ignore"):
-        yld_pct = (div / price.replace(0, np.nan)) * 100.0
-    # Ensure we have at least some finite yields; if all NaN, keep as empty series (but don't skip plotting)
-    yld_pct = pd.Series(yld_pct.values, index=dates, dtype=float)
+        yld_raw = div / price
+    yld_pct_series = (yld_raw * 100.0).replace([np.inf, -np.inf], np.nan)
+    yld_pct_series = pd.Series(yld_pct_series.values, index=dates)
+
+    # Diagnostics to help when yield "disappears"
+    finite_mask = np.isfinite(yld_pct_series.values)
+    n_total = len(yld_pct_series)
+    n_finite = int(np.sum(finite_mask))
+    print(f"[INFO] Yield points for {symbol}: total={n_total}, finite={n_finite}, zeros_div={int((div==0).sum())}, zeros_price={int((price==0).sum())}")
 
     # TR paths
     tr_untaxed = total_return_series(dates, price, div, div_factor=1.0)
@@ -258,18 +264,24 @@ def plot_distribution_analysis(ticker: str, outdir: Path) -> Path:
         y0, y1 = mean_std_bounds(pd.concat([ann_untaxed, ann_tfsa]), clamp_zero=False)
         ax_ann.set_ylim(y0, y1)
 
-    # YIELD on Ex-Date Price (%) (dark orange dashed, second right)
+    # YIELD on Ex-Date Price (%) (dark orange dashed, second right) — robust plotting
     ax_yld = ax_price.twinx()
     ax_yld.spines.right.set_position(("axes", 1.11))
     ax_yld.spines.right.set_visible(True)
     ax_yld.spines["right"].set_color(DARK_ORANGE)
-    # Plot even if some yields are NaN — masked line will show where data exist
-    ax_yld.plot(yld_pct.index, yld_pct.values, color=DARK_ORANGE, linestyle="--", linewidth=2.0,
-                label="Yield on Ex-Date Price (%)", zorder=6)
+    if n_finite > 0:
+        # Only plot finite points (prevents Matplotlib from dropping the whole line)
+        x = dates.values
+        y = yld_pct_series.values
+        mask = np.isfinite(y)
+        ax_yld.plot(x[mask], y[mask], color=DARK_ORANGE, linestyle="--", linewidth=2.0,
+                    label="Yield on Ex-Date Price (%)", zorder=6)
+        y0, y1 = mean_std_bounds(pd.Series(y[mask], index=dates[mask]), clamp_zero=True)
+        ax_yld.set_ylim(y0, y1)
+    else:
+        print(f"[WARN] No finite yield points for {symbol} — skipping yield plot.")
     ax_yld.set_ylabel("Yield on Ex-Date Price (%)", color=DARK_ORANGE)
     ax_yld.tick_params(axis="y", colors=DARK_ORANGE)
-    y0, y1 = mean_std_bounds(yld_pct, clamp_zero=True)
-    ax_yld.set_ylim(y0, y1)
 
     # Title, x-axis label, x-limits
     ax_price.set_title(f"{symbol} Distribution Analysis", fontsize=16)
@@ -280,7 +292,7 @@ def plot_distribution_analysis(ticker: str, outdir: Path) -> Path:
         pad_days = max(1, int(span_days * 0.03))
         ax_price.set_xlim(dmin - pd.Timedelta(days=pad_days), dmax + pd.Timedelta(days=pad_days))
 
-    # UTC timestamp stamp bottom-right
+    # UTC timestamp bottom-right
     ts = dt.datetime.utcnow().strftime("Generated (UTC): %Y-%m-%d %H:%M")
     plt.figtext(0.995, 0.015, ts, ha="right", va="bottom", fontsize=10, color="#666666")
 
