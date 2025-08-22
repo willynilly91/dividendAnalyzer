@@ -8,7 +8,7 @@ on:
         required: true
         type: string
       currency:
-        description: "Currency / history CSV to use"
+        description: "Currency"
         required: true
         type: choice
         options: [CAD, USD]
