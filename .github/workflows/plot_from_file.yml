@@ -7,21 +7,28 @@ on:
         description: "Choose ticker file from repository"
         required: true
         type: choice
-        options:
-          - us_tickers.txt
-          - ca_tickers.txt
+        options: [us_tickers.txt, ca_tickers.txt]
         default: us_tickers.txt
       outdir:
         description: "Output directory for PNG files"
         required: true
         type: string
         default: graphs
-      force_replot:
-        description: "Force re-plot even if PNG is already up-to-date?"
+      force_overwrite:
+        description: "Force overwrite (re-plot even if PNG is up-to-date)?"
         required: true
         type: choice
         options: [no, yes]
         default: no
+
+      # Series toggles
+      s_price:      { description: "Show: Price on Ex-Date",                           required: true, type: choice, options: [no, yes], default: yes }
+      s_dividends:  { description: "Show: Dividends",                                   required: true, type: choice, options: [no, yes], default: yes }
+      s_growth:     { description: "Show: Growth of $10,000",                           required: true, type: choice, options: [no, yes], default: yes }
+      s_growth_wht: { description: "Show: Growth of $10,000 (Less 15% US WHT) [USD]",   required: true, type: choice, options: [no, yes], default: yes }
+      s_ann:        { description: "Show: Total Annualized Return (>=12 months)",       required: true, type: choice, options: [no, yes], default: yes }
+      s_ann_wht:    { description: "Show: Ann. Return (Less 15% US WHT) [USD]",         required: true, type: choice, options: [no, yes], default: yes }
+      s_yield:      { description: "Show: Annualized Yield (%) from CSV",               required: true, type: choice, options: [no, yes], default: yes }
 
 permissions:
   contents: write
@@ -29,7 +36,6 @@ permissions:
 jobs:
   plot-from-file:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -45,7 +51,6 @@ jobs:
           if [ -f requirements.txt ]; then
             pip install -r requirements.txt
           else
-            # Core libs for your plotter and for history_updater bootstrap path
             pip install pandas numpy matplotlib yfinance requests beautifulsoup4 lxml
           fi
 
@@ -56,80 +61,79 @@ jobs:
           case "$FILE" in
             us_tickers.txt) CURRENCY=USD ;;
             ca_tickers.txt) CURRENCY=CAD ;;
-            *)
-              # Fallback heuristic: filenames containing "ca" → CAD; else USD
-              if echo "$FILE" | grep -Ei '(^|[_-])(ca|cad)([_.-]|$)' >/dev/null; then
-                CURRENCY=CAD
-              else
-                CURRENCY=USD
-              fi
-              ;;
+            *) CURRENCY=USD ;;
           esac
           echo "currency=$CURRENCY" >> "$GITHUB_OUTPUT"
-          echo "Selected file: $FILE | Decided currency: $CURRENCY"
 
-      - name: Generate graphs for all tickers in file
+      - name: Build series flags
+        id: flags
+        env:
+          CUR:        ${{ steps.decide.outputs.currency }}
+          S_PRICE:    ${{ github.event.inputs.s_price }}
+          S_DIV:      ${{ github.event.inputs.s_dividends }}
+          S_GROW:     ${{ github.event.inputs.s_growth }}
+          S_GROWWHT:  ${{ github.event.inputs.s_growth_wht }}
+          S_ANN:      ${{ github.event.inputs.s_ann }}
+          S_ANNWHT:   ${{ github.event.inputs.s_ann_wht }}
+          S_YIELD:    ${{ github.event.inputs.s_yield }}
+        run: |
+          FLAGS=""
+          [ "$S_PRICE"   = "yes" ] && FLAGS="$FLAGS --price"
+          [ "$S_DIV"     = "yes" ] && FLAGS="$FLAGS --dividends"
+          [ "$S_GROW"    = "yes" ] && FLAGS="$FLAGS --growth"
+          # US-withholding lines only for USD
+          if [ "$CUR" = "USD" ] && [ "$S_GROWWHT" = "yes" ]; then FLAGS="$FLAGS --growth-wht"; fi
+          [ "$S_ANN"     = "yes" ] && FLAGS="$FLAGS --ann"
+          if [ "$CUR" = "USD" ] && [ "$S_ANNWHT" = "yes" ]; then FLAGS="$FLAGS --ann-wht"; fi
+          [ "$S_YIELD"   = "yes" ] && FLAGS="$FLAGS --yield"
+          echo "flags=$FLAGS" >> "$GITHUB_OUTPUT"
+
+      - name: Generate graphs for all tickers
         shell: bash
         env:
-          TICKERS_FILE: ${{ github.event.inputs.tickers_file }}
-          CURRENCY: ${{ steps.decide.outputs.currency }}
-          OUTDIR: ${{ github.event.inputs.outdir }}
-          FORCE: ${{ github.event.inputs.force_replot }}
+          TICKERS_FILE:   ${{ github.event.inputs.tickers_file }}
+          CURRENCY:       ${{ steps.decide.outputs.currency }}
+          OUTDIR:         ${{ github.event.inputs.outdir }}
+          FORCE_OVER:     ${{ github.event.inputs.force_overwrite }}
+          FLAGS:          ${{ steps.flags.outputs.flags }}
         run: |
           set -euo pipefail
-
-          if [ ! -f "$TICKERS_FILE" ]; then
-            echo "ERROR: Tickers file not found: $TICKERS_FILE"
-            echo "Repo root contents:"; ls -la
-            exit 1
-          fi
-
+          [ -f "$TICKERS_FILE" ] || { echo "Missing $TICKERS_FILE"; exit 1; }
           mkdir -p "$OUTDIR"
 
           total=0; ok=0; failed=0
           while IFS= read -r line || [ -n "$line" ]; do
-            ticker="$(echo "$line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
-            # Skip blanks / comments
-            if [ -z "$ticker" ] || [[ "$ticker" =~ ^# ]]; then
-              continue
-            fi
+            t="$(echo "$line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+            [ -z "$t" ] && continue
+            [[ "$t" =~ ^# ]] && continue
             total=$((total+1))
-            echo "Plotting $ticker ($CURRENCY)"
-            if [ "$FORCE" = "yes" ]; then
-              FORCE_FLAG="--force"
-            else
-              FORCE_FLAG=""
-            fi
+            echo "Plotting $t ($CURRENCY)"
+
+            # Pass --force when Force Overwrite is yes
+            [ "$FORCE_OVER" = "yes" ] && FORCE="--force" || FORCE=""
+
             set +e
-            python plot_ticker_graph.py "$ticker" --currency "$CURRENCY" --outdir "$OUTDIR" $FORCE_FLAG
+            python plot_ticker_graph.py "$t" --currency "$CURRENCY" --outdir "$OUTDIR" $FORCE $FLAGS
             rc=$?
             set -e
             if [ $rc -eq 0 ]; then
-              echo "  [ok] $ticker"
-              ok=$((ok+1))
+              echo "  [ok] $t"; ok=$((ok+1))
             else
-              echo "  [warn] Failed for $ticker (exit $rc)"
-              failed=$((failed+1))
+              echo "  [warn] Failed for $t (exit $rc)"; failed=$((failed+1))
             fi
           done < "$TICKERS_FILE"
 
           echo "Summary: total=$total ok=$ok failed=$failed"
-          # Don't fail the job if some tickers failed; artifacts will still be committed
-          if [ $ok -eq 0 ]; then
-            echo "No graphs produced."
-          fi
 
       - name: List outputs
         run: |
-          echo "=== Output directory ==="
           ls -la "${{ github.event.inputs.outdir }}" || true
 
-      - name: Commit and push artifacts (PNGs and any updated ticker lists)
+      - name: Commit and push artifacts (PNGs + any updated ticker lists)
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add -f "${{ github.event.inputs.outdir }}"/*.png || true
-          # Include updated tickers files (plotter may append new symbols)
           git add -f us_tickers.txt ca_tickers.txt || true
-          git commit -m "Graphs from ${{ github.event.inputs.tickers_file }} (currency ${{ steps.decide.outputs.currency }})" || echo "Nothing to commit"
+          git commit -m "Batch graphs from ${{ github.event.inputs.tickers_file }} (${{ steps.decide.outputs.currency }}) [force_overwrite=${{ github.event.inputs.force_overwrite }}]" || echo "Nothing to commit"
           git push || true
