@@ -3,13 +3,13 @@
 plot_ticker_graph.py
 
 Generates a chart for a single ticker showing:
-  - Price on Ex-Date ($ <currency>)  ........ red line (left axis)
-  - Dividends ($) ............................ blue bars (right axis)
-  - Total Return of $10,000 ($) .............. green solid (second left axis, bold)
-  - Total Return of $10,000 less 15% US Witholding Tax ($) ... green solid (second left axis, thin)
-  - Total Annualized Return (%) .............. light-green dashed (third left axis, bold; starts after >=6 months)
-  - Total Annualized Return less 15% US Witholding Tax (%) ... light-green dashed (third left axis, thin; starts after >=6 months)
-  - Yield on Ex-Date Price (%) ............... dark orange dashed (second right axis)
+  - Price on Ex-Date ($ <currency>)  ........ red line (LEFT base axis)
+  - Dividends ($) ............................ blue bars (LEFT extra axis)
+  - Growth of $10,000 ........................ green solid (LEFT extra axis, bold)
+  - Growth of $10,000 (Less 15% US Witholding Tax) ... green solid (LEFT extra axis, thin)
+  - Total Annualized Return (%) .............. darkened light-green dashed (RIGHT extra axis, bold; starts after >=6 months)
+  - Total Annualized Return less 15% US Witholding Tax (%) ... darkened light-green dashed (RIGHT extra axis, thin; starts after >=6 months)
+  - Yield on Ex-Date Price (%) ............... dark orange dashed (RIGHT extra axis)
 
 Inputs (event-style history produced by your pipeline):
   - historical_etf_yields_us.csv
@@ -38,11 +38,11 @@ HIST_US = Path("historical_etf_yields_us.csv")
 CA_SUFFIXES = (".TO", ".NE", ".V", ".CN")
 
 # Colors
-RED = "#D62728"
-BLUE = "#1F77B4"
-GREEN = "#2CA02C"
-LIGHT_GREEN = "#7ED957"
-DARK_ORANGE = "#B86E00"
+RED = "#D62728"          # Price
+BLUE = "#1F77B4"         # Dividends
+GREEN = "#2CA02C"        # Growth of $10,000 (both untaxed/taxed)
+ANN_GREEN = "#2E8B57"    # Darkened light-green for Annualized Return (%)
+DARK_ORANGE = "#B86E00"  # Yield
 
 # ---------- ticker normalization ----------
 def _strip_prefixes(sym: str) -> str:
@@ -120,8 +120,8 @@ def compute_bar_width(dates: pd.Series) -> int:
     return max(3, min(40, int(gaps.median() * 0.6)))
 
 # ---------- TR / metrics ----------
-def total_return_series(dates: pd.Series, price: pd.Series, div: pd.Series, div_factor: float) -> pd.Series:
-    """Event-date TR with reinvestment at event price; div_factor=1.0 untaxed; 0.85 taxed."""
+def growth_series(dates: pd.Series, price: pd.Series, div: pd.Series, div_factor: float) -> pd.Series:
+    """Event-date 'Growth of $10,000' with reinvestment at event price; div_factor=1.0 untaxed; 0.85 taxed."""
     price = price.astype(float)
     div = div.fillna(0.0).astype(float)
     if price.empty or not math.isfinite(price.iloc[0]) or price.iloc[0] <= 0:
@@ -139,14 +139,14 @@ def total_return_series(dates: pd.Series, price: pd.Series, div: pd.Series, div_
             vals.append(vals[-1])
     return pd.Series(vals, index=dates)
 
-def annualized_return_series(tr_path: pd.Series) -> pd.Series:
+def annualized_return_series(growth_path: pd.Series) -> pd.Series:
     """Inception-to-date annualized %; start after >= ~6 months (182 days)."""
-    out = pd.Series(index=tr_path.index, dtype=float)
-    if tr_path.empty:
+    out = pd.Series(index=growth_path.index, dtype=float)
+    if growth_path.empty:
         return out.dropna()
-    start_date = tr_path.index[0]
+    start_date = growth_path.index[0]
     start_val = 10000.0
-    for d, v in tr_path.items():
+    for d, v in growth_path.items():
         days = (d - start_date).days
         if days >= 182 and v > 0:
             out.loc[d] = ((v / start_val) ** (365.0 / days) - 1.0) * 100.0
@@ -190,28 +190,29 @@ def plot_distribution_analysis(ticker: str, outdir: Path) -> Path:
     with np.errstate(divide="ignore", invalid="ignore"):
         yld_raw = div / price
     yld_pct_series = (yld_raw * 100.0).replace([np.inf, -np.inf], np.nan)
-    yld_pct_series = pd.Series(yld_pct_series.values, index=dates)
+    yld_pct_series = pd.Series(yld_pct_series.values, index=dates, dtype=float)
 
-    # Diagnostics to help when yield "disappears"
+    # Diagnostics help when yield “disappears”
     finite_mask = np.isfinite(yld_pct_series.values)
     n_total = len(yld_pct_series)
     n_finite = int(np.sum(finite_mask))
     print(f"[INFO] Yield points for {symbol}: total={n_total}, finite={n_finite}, zeros_div={int((div==0).sum())}, zeros_price={int((price==0).sum())}")
 
-    # TR paths
-    tr_untaxed = total_return_series(dates, price, div, div_factor=1.0)
-    tr_tfsa    = total_return_series(dates, price, div, div_factor=0.85)
+    # Growth paths
+    growth = growth_series(dates, price, div, div_factor=1.0)
+    growth_wht = growth_series(dates, price, div, div_factor=0.85)
 
     # Annualized %
-    ann_untaxed = annualized_return_series(tr_untaxed)
-    ann_tfsa    = annualized_return_series(tr_tfsa)
+    ann = annualized_return_series(growth)
+    ann_wht = annualized_return_series(growth_wht)
 
     # ----- figure layout -----
     fig = plt.figure(figsize=(18, 10))  # large canvas; legend space below
+    # main axes bounds [left, bottom, width, height] in fig fraction
     ax_left, ax_bottom, ax_width, ax_height = 0.10, 0.23, 0.80, 0.67
     ax_price = fig.add_axes([ax_left, ax_bottom, ax_width, ax_height])
 
-    # PRICE (red, left)
+    # PRICE (red, LEFT base)
     price_label = f"Price on Ex-Date ($ {cur})"
     ax_price.plot(dates, price, color=RED, linewidth=2.2, label=price_label, zorder=3)
     ax_price.set_ylabel(price_label, color=RED)
@@ -219,58 +220,59 @@ def plot_distribution_analysis(ticker: str, outdir: Path) -> Path:
     y0, y1 = mean_std_bounds(price, clamp_zero=True)
     ax_price.set_ylim(y0, y1)
 
-    # DIVIDENDS (blue bars, right)
+    # DIVIDENDS ($) — now on a LEFT extra axis (blue bars)
+    ax_div_left = ax_price.twinx()
+    ax_div_left.spines.left.set_position(("axes", -0.18))  # farther left than growth axis
+    ax_div_left.spines.left.set_visible(True)
+    ax_div_left.yaxis.set_label_position("left")
+    ax_div_left.yaxis.tick_left()
+    ax_div_left.spines["left"].set_color(BLUE)
     bar_w = compute_bar_width(dates)
-    ax_div = ax_price.twinx()
-    ax_div.bar(dates, div, width=bar_w, alpha=0.35, color=BLUE, label="Dividends", align="center", zorder=2)
-    ax_div.set_ylabel("Dividends ($)", color=BLUE)
-    ax_div.tick_params(axis="y", colors=BLUE)
+    ax_div_left.bar(dates, div, width=bar_w, alpha=0.35, color=BLUE, label="Dividends", align="center", zorder=2)
+    ax_div_left.set_ylabel("Dividends ($)", color=BLUE)
+    ax_div_left.tick_params(axis="y", colors=BLUE)
     y0, y1 = mean_std_bounds(div, clamp_zero=True)
-    ax_div.set_ylim(y0, y1)
-    ax_div.spines.right.set_position(("axes", 1.05))
+    ax_div_left.set_ylim(y0, y1)
 
-    # TOTAL RETURN ($) (green, second left) — solid bold vs thin
-    ax_tr = ax_price.twinx()
-    ax_tr.spines.left.set_position(("axes", -0.09))
-    ax_tr.spines.left.set_visible(True)
-    ax_tr.yaxis.set_label_position("left")
-    ax_tr.yaxis.tick_left()
-    ax_tr.spines["left"].set_color(GREEN)
-    ax_tr.plot(tr_untaxed.index, tr_untaxed.values, color=GREEN, linestyle="-", linewidth=2.6,
-               label="Total Return of $10,000", zorder=4)
-    ax_tr.plot(tr_tfsa.index,    tr_tfsa.values,    color=GREEN, linestyle="-", linewidth=1.4,
-               label="Total Return of $10,000 less 15% US Witholding Tax", zorder=4)
-    ax_tr.set_ylabel("Total Return ($)", color=GREEN)
-    ax_tr.tick_params(axis="y", colors=GREEN)
-    y0, y1 = mean_std_bounds(pd.concat([tr_untaxed, tr_tfsa]), clamp_zero=True)
-    ax_tr.set_ylim(y0, y1)
+    # GROWTH OF $10,000 — LEFT extra axis (green solid; bold vs thin)
+    ax_growth = ax_price.twinx()
+    ax_growth.spines.left.set_position(("axes", -0.09))  # between price and dividends axes
+    ax_growth.spines.left.set_visible(True)
+    ax_growth.yaxis.set_label_position("left")
+    ax_growth.yaxis.tick_left()
+    ax_growth.spines["left"].set_color(GREEN)
+    ax_growth.plot(growth.index, growth.values, color=GREEN, linestyle="-", linewidth=2.6,
+                   label="Growth of $10,000", zorder=4)
+    ax_growth.plot(growth_wht.index, growth_wht.values, color=GREEN, linestyle="-", linewidth=1.4,
+                   label="Growth of $10,000 (Less 15% US Witholding Tax)", zorder=4)
+    ax_growth.set_ylabel("Growth of $10,000", color=GREEN)
+    ax_growth.tick_params(axis="y", colors=GREEN)
+    y0, y1 = mean_std_bounds(pd.concat([growth, growth_wht]), clamp_zero=True)
+    ax_growth.set_ylim(y0, y1)
 
-    # TOTAL ANNUALIZED RETURN (%) (light green, third left) — dashed bold vs thin
-    ax_ann = ax_price.twinx()
-    ax_ann.spines.left.set_position(("axes", -0.18))
-    ax_ann.spines.left.set_visible(True)
-    ax_ann.yaxis.set_label_position("left")
-    ax_ann.yaxis.tick_left()
-    ax_ann.spines["left"].set_color(LIGHT_GREEN)
-    if not ann_untaxed.empty:
-        ax_ann.plot(ann_untaxed.index, ann_untaxed.values, color=LIGHT_GREEN, linestyle="--", linewidth=2.6,
-                    label="Total Annualized Return (%)", zorder=5)
-    if not ann_tfsa.empty:
-        ax_ann.plot(ann_tfsa.index, ann_tfsa.values, color=LIGHT_GREEN, linestyle="--", linewidth=1.4,
-                    label="Total Annualized Return less 15% US Witholding Tax (%)", zorder=5)
-    ax_ann.set_ylabel("Total Annualized Return (%)", color=LIGHT_GREEN)
-    ax_ann.tick_params(axis="y", colors=LIGHT_GREEN)
-    if not ann_untaxed.empty or not ann_tfsa.empty:
-        y0, y1 = mean_std_bounds(pd.concat([ann_untaxed, ann_tfsa]), clamp_zero=False)
-        ax_ann.set_ylim(y0, y1)
+    # TOTAL ANNUALIZED RETURN (%) — RIGHT extra axis (darkened light-green, dashed; bold vs thin)
+    ax_ann_right = ax_price.twinx()
+    ax_ann_right.spines.right.set_position(("axes", 1.05))  # inside of yield axis
+    ax_ann_right.spines.right.set_visible(True)
+    ax_ann_right.spines["right"].set_color(ANN_GREEN)
+    if not ann.empty:
+        ax_ann_right.plot(ann.index, ann.values, color=ANN_GREEN, linestyle="--", linewidth=2.6,
+                          label="Total Annualized Return (%)", zorder=5)
+    if not ann_wht.empty:
+        ax_ann_right.plot(ann_wht.index, ann_wht.values, color=ANN_GREEN, linestyle="--", linewidth=1.4, alpha=0.9,
+                          label="Total Annualized Return less 15% US Witholding Tax (%)", zorder=5)
+    ax_ann_right.set_ylabel("Total Annualized Return (%)", color=ANN_GREEN)
+    ax_ann_right.tick_params(axis="y", colors=ANN_GREEN)
+    if not ann.empty or not ann_wht.empty:
+        y0, y1 = mean_std_bounds(pd.concat([ann, ann_wht]), clamp_zero=False)
+        ax_ann_right.set_ylim(y0, y1)
 
-    # YIELD on Ex-Date Price (%) (dark orange dashed, second right) — robust plotting
+    # YIELD on Ex-Date Price (%) — RIGHT extra axis (dark orange, dashed)
     ax_yld = ax_price.twinx()
-    ax_yld.spines.right.set_position(("axes", 1.11))
+    ax_yld.spines.right.set_position(("axes", 1.12))  # outside ann axis
     ax_yld.spines.right.set_visible(True)
     ax_yld.spines["right"].set_color(DARK_ORANGE)
     if n_finite > 0:
-        # Only plot finite points (prevents Matplotlib from dropping the whole line)
         x = dates.values
         y = yld_pct_series.values
         mask = np.isfinite(y)
@@ -298,7 +300,7 @@ def plot_distribution_analysis(ticker: str, outdir: Path) -> Path:
 
     # Legend below plot (no clipping)
     handles, labels = [], []
-    for a in (ax_price, ax_div, ax_tr, ax_ann, ax_yld):
+    for a in (ax_price, ax_div_left, ax_growth, ax_ann_right, ax_yld):
         h, l = a.get_legend_handles_labels()
         handles += h; labels += l
     if handles:
