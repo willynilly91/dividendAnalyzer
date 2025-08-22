@@ -1,4 +1,4 @@
-name: Plot Single Ticker · Manual
+name: Plot Single Ticker Workflow
 
 on:
   workflow_dispatch:
