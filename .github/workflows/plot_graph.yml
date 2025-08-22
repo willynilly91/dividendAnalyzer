@@ -1,38 +1,29 @@
-name: Plot Single Ticker Workflow
+name: Plot Single Ticker
 
 on:
   workflow_dispatch:
     inputs:
       ticker:
-        description: "Ticker (e.g., ULTY, HYLD.TO, HYLD-TO)"
+        description: "Ticker symbol (e.g., ULTY or EIT-UN.TO)"
         required: true
         type: string
       currency:
-        description: "History CSV to use"
+        description: "Which historical CSV to use"
         required: true
         type: choice
         options: [USD, CAD]
         default: USD
       outdir:
-        description: "Output directory"
+        description: "Output directory for PNG files"
         required: true
         type: string
         default: graphs
-      force_overwrite:
-        description: "Force overwrite (skip freshness check)?"
+      force_replot:
+        description: "Force re-plot even if PNG is already up-to-date?"
         required: true
         type: choice
         options: [no, yes]
         default: no
-
-      # Series toggles (pick the lines you want plotted)
-      s_price:      { description: "Price on Ex-Date",                               required: true, type: choice, options: [no, yes], default: yes }
-      s_dividends:  { description: "Dividends ($)",                                   required: true, type: choice, options: [no, yes], default: yes }
-      s_growth:     { description: "Growth of $10,000",                               required: true, type: choice, options: [no, yes], default: yes }
-      s_growth_wht: { description: "Growth of $10,000 (Less 15% US WHT) [USD only]",  required: true, type: choice, options: [no, yes], default: yes }
-      s_ann:        { description: "Total Annualized Return (>=12 months)",           required: true, type: choice, options: [no, yes], default: yes }
-      s_ann_wht:    { description: "Ann. Return (Less 15% US WHT) [USD only]",        required: true, type: choice, options: [no, yes], default: yes }
-      s_yield:      { description: "Annualized Yield (%) from CSV",                   required: true, type: choice, options: [no, yes], default: yes }
 
 permissions:
   contents: write
@@ -40,6 +31,7 @@ permissions:
 jobs:
   plot-single:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -49,59 +41,40 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install dependencies (plotter + bootstrap)
+      - name: Install dependencies (plotting + bootstrap scraping)
         run: |
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then
             pip install -r requirements.txt
           else
+            # Core libs for your plotter and for history_updater bootstrap path
             pip install pandas numpy matplotlib yfinance requests beautifulsoup4 lxml
           fi
 
-      - name: Build series flags
-        id: flags
+      - name: Generate graph
         env:
-          CUR:        ${{ github.event.inputs.currency }}
-          S_PRICE:    ${{ github.event.inputs.s_price }}
-          S_DIV:      ${{ github.event.inputs.s_dividends }}
-          S_GROW:     ${{ github.event.inputs.s_growth }}
-          S_GROWWHT:  ${{ github.event.inputs.s_growth_wht }}
-          S_ANN:      ${{ github.event.inputs.s_ann }}
-          S_ANNWHT:   ${{ github.event.inputs.s_ann_wht }}
-          S_YIELD:    ${{ github.event.inputs.s_yield }}
-        run: |
-          FLAGS=""
-          [ "$S_PRICE"   = "yes" ] && FLAGS="$FLAGS --price"
-          [ "$S_DIV"     = "yes" ] && FLAGS="$FLAGS --dividends"
-          [ "$S_GROW"    = "yes" ] && FLAGS="$FLAGS --growth"
-          # Only pass WHT flags for USD (CAD is ignored by the script too, but we guard here)
-          if [ "$CUR" = "USD" ] && [ "$S_GROWWHT" = "yes" ]; then FLAGS="$FLAGS --growth-wht"; fi
-          [ "$S_ANN"     = "yes" ] && FLAGS="$FLAGS --ann"
-          if [ "$CUR" = "USD" ] && [ "$S_ANNWHT" = "yes" ]; then FLAGS="$FLAGS --ann-wht"; fi
-          [ "$S_YIELD"   = "yes" ] && FLAGS="$FLAGS --yield"
-          echo "flags=$FLAGS" >> "$GITHUB_OUTPUT"
-
-      - name: Plot single ticker
-        env:
-          FORCE: ${{ github.event.inputs.force_overwrite }}
+          FORCE: ${{ github.event.inputs.force_replot }}
         run: |
           mkdir -p "${{ github.event.inputs.outdir }}"
-          [ "$FORCE" = "yes" ] && FORCE_FLAG="--force" || FORCE_FLAG=""
-          python plot_ticker_graph.py \
-            "${{ github.event.inputs.ticker }}" \
+          if [ "$FORCE" = "yes" ]; then
+            FORCE_FLAG="--force"
+          else
+            FORCE_FLAG=""
+          fi
+          python plot_ticker_graph.py "${{ github.event.inputs.ticker }}" \
             --currency "${{ github.event.inputs.currency }}" \
-            --outdir "${{ github.event.inputs.outdir }}" \
-            $FORCE_FLAG ${{ steps.flags.outputs.flags }}
+            --outdir "${{ github.event.inputs.outdir }}" $FORCE_FLAG
 
-      - name: Commit and push graph (and updated ticker lists if any)
+      - name: List outputs
+        run: |
+          echo "=== Output directory ==="
+          ls -la "${{ github.event.inputs.outdir }}" || true
+
+      - name: Commit and push artifacts (PNG + updated ticker lists)
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add -f "${{ github.event.inputs.outdir }}"/*.png || true
           git add -f us_tickers.txt ca_tickers.txt || true
-          git commit -m "Plot ${{
-              github.event.inputs.ticker
-            }} (${{ github.event.inputs.currency }}) [force=${{
-              github.event.inputs.force_overwrite
-            }}]" || echo "Nothing to commit"
+          git commit -m "Graph for ${{ github.event.inputs.ticker }} (${{ github.event.inputs.currency }})" || echo "Nothing to commit"
           git push || true
