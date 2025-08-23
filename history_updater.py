@@ -4,7 +4,7 @@ history_updater.py
 
 Robust, rate-limit-aware history bootstrapper/updater.
 
-Public API (compatible with your conductor.py and plotter):
+Public API (compatible with conductor.py and plotter):
     ensure_history(
         tickers: list[str],
         csv_path: str | os.PathLike,
@@ -15,7 +15,9 @@ Public API (compatible with your conductor.py and plotter):
         max_retries: int = 8,
         commit_each: bool = True,
         retention_days: int | None = None,
-        grace_days_incremental: int | None = None,   # NEW: extra days appended to retention window
+        grace_days_incremental: int | None = None,
+        chunk_size_backfill: int | None = None,
+        **kwargs,   # ← ignore unknown future knobs from conductor.py
     )
 
 Behavior:
@@ -25,12 +27,12 @@ Behavior:
       * Upsert rows into target CSV by key (Ticker, Ex-Div Date).
       * If retention is configured, prune to last (retention_days + grace_days_incremental) days.
       * Write CSV immediately and git commit after each ticker (checkpoint).
-  - Global throttling between tickers.
+  - Throttle between tickers; if chunk_size_backfill is set, also sleep between chunks.
 """
 
 from __future__ import annotations
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, List
 import os
 import math
 import random
@@ -56,7 +58,7 @@ def _normalize_symbol_for_yahoo(sym: str) -> str:
     return s
 
 # --------- Git helpers ----------
-def _git_commit(paths: list[Path], message: str) -> None:
+def _git_commit(paths: List[Path], message: str) -> None:
     try:
         subprocess.run(["git", "rev-parse", "--is-inside-work-tree"], check=True,
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -68,6 +70,7 @@ def _git_commit(paths: list[Path], message: str) -> None:
                 subprocess.run(["git", "add", "-f", str(p)], check=False)
         subprocess.run(["git", "commit", "-m", message], check=False)
     except Exception:
+        # Never let git errors crash scraping
         pass
 
 # --------- yfinance (lazy import) ----------
@@ -87,6 +90,9 @@ class RateLimiter:
 
     def nap_between_tickers(self):
         time.sleep(self.per_ticker_sleep + random.uniform(0.0, 0.6))
+
+    def nap_between_chunks(self, seconds: float):
+        time.sleep(float(seconds) + random.uniform(0.0, 1.0))
 
     def backoff_sleep(self, attempt: int):
         delay = min(self.base_backoff * (self.backoff_factor ** (attempt - 1)), self.max_backoff)
@@ -231,10 +237,13 @@ def ensure_history(
     commit_each: bool = True,
     retention_days: int | None = None,
     grace_days_incremental: int | None = None,
+    chunk_size_backfill: int | None = None,
+    **kwargs,  # ← ignore unknown args from conductor.py to prevent future breakage
 ) -> None:
     """
     Ensure history rows exist for each ticker in `csv_path`. Writes & commits after each ticker.
     If retention_days is provided, keeps only the last (retention_days + grace_days_incremental) days.
+    If chunk_size_backfill is provided (>0), process tickers in small chunks with a rest between chunks.
     """
     csvp = Path(csv_path)
     csvp.parent.mkdir(parents=True, exist_ok=True)
@@ -249,42 +258,68 @@ def ensure_history(
 
     existing = _read_csv(csvp)
 
-    total = ok = skipped = failed = 0
-    for raw in tickers:
-        sym = (raw or "").strip()
-        if not sym:
-            continue
-        total += 1
-        print(f"[INFO] Scraping {sym} into {csvp.name} ...")
-        try:
-            df_new = _fetch_divs_and_prices(sym, rl=rl)
-            if df_new.empty:
-                print(f"[WARN] {sym}: no dividend data found (skipping).")
-                skipped += 1
-            else:
-                norm = _normalize_symbol_for_yahoo(sym)
-                df_new = df_new[df_new["Ticker"].astype(str) == norm]
+    # chunking config
+    chunk_n = int(chunk_size_backfill or 0)
+    rest_between_chunks = max(8.0, rl.base_backoff * 2) if chunk_n > 0 else 0.0
+
+    def _process_batch(batch: List[str]):
+        nonlocal existing
+        total = ok = skipped = failed = 0
+        for raw in batch:
+            sym = (raw or "").strip()
+            if not sym:
+                continue
+            total += 1
+            print(f"[INFO] Scraping {sym} into {csvp.name} ...")
+            try:
+                df_new = _fetch_divs_and_prices(sym, rl=rl)
                 if df_new.empty:
-                    print(f"[WARN] {sym}: normalized symbol has no rows (skipping).")
+                    print(f"[WARN] {sym}: no dividend data found (skipping).")
                     skipped += 1
                 else:
-                    existing = _upsert(existing, df_new)
-                    if retention_days:
-                        existing = _prune_retention(existing, retention_days, grace_days_incremental)
-                        print(f"[INFO] Pruned {csvp.name} to last {int(retention_days) + int(grace_days_incremental or 0)} days; rows={len(existing)}")
-                    existing.to_csv(csvp, index=False)
-                    ok += 1
-                    if commit_each:
-                        _git_commit(
-                            [csvp],
-                            f"history_updater: upsert {norm} ({len(df_new)} rows)"
-                            + (f" + prune({int(retention_days) + int(grace_days_incremental or 0)}d)" if retention_days else "")
-                        )
-                    print(f"[OK] {norm}: wrote/updated {len(df_new)} row(s).")
-        except Exception as e:
-            failed += 1
-            print(f"[ERROR] {sym}: {e}")
+                    norm = _normalize_symbol_for_yahoo(sym)
+                    df_new = df_new[df_new["Ticker"].astype(str) == norm]
+                    if df_new.empty:
+                        print(f"[WARN] {sym}: normalized symbol has no rows (skipping).")
+                        skipped += 1
+                    else:
+                        existing = _upsert(existing, df_new)
+                        if retention_days:
+                            existing = _prune_retention(existing, retention_days, grace_days_incremental)
+                            window = int(retention_days) + int(grace_days_incremental or 0)
+                            print(f"[INFO] Pruned {csvp.name} to last {window} days; rows={len(existing)}")
+                        existing.to_csv(csvp, index=False)
+                        ok += 1
+                        if commit_each:
+                            window_txt = ""
+                            if retention_days:
+                                window_txt = f" + prune({int(retention_days) + int(grace_days_incremental or 0)}d)"
+                            _git_commit([csvp], f"history_updater: upsert {norm} ({len(df_new)} rows){window_txt}")
+                        print(f"[OK] {norm}: wrote/updated {len(df_new)} row(s).")
+            except Exception as e:
+                failed += 1
+                print(f"[ERROR] {sym}: {e}")
 
-        rl.nap_between_tickers()
+            rl.nap_between_tickers()
 
-    print(f"[SUMMARY] total={total} ok={ok} skipped={skipped} failed={failed}")
+        return total, ok, skipped, failed
+
+    # Drive either in chunks or all at once
+    tickers_list = [t for t in (tickers or []) if (t or "").strip()]
+    grand = dict(total=0, ok=0, skipped=0, failed=0)
+
+    if chunk_n > 0:
+        for i in range(0, len(tickers_list), chunk_n):
+            batch = tickers_list[i:i+chunk_n]
+            print(f"[INFO] Processing batch {i//chunk_n + 1} of {math.ceil(len(tickers_list)/chunk_n)} (size={len(batch)})")
+            t, o, s, f = _process_batch(batch)
+            grand["total"] += t; grand["ok"] += o; grand["skipped"] += s; grand["failed"] += f
+            # rest between chunks to be gentle
+            if i + chunk_n < len(tickers_list):
+                print(f"[INFO] Resting {int(rest_between_chunks)}s between batches to avoid rate limits…")
+                rl.nap_between_chunks(rest_between_chunks)
+    else:
+        t, o, s, f = _process_batch(tickers_list)
+        grand["total"] += t; grand["ok"] += o; grand["skipped"] += s; grand["failed"] += f
+
+    print(f"[SUMMARY] total={grand['total']} ok={grand['ok']} skipped={grand['skipped']} failed={grand['failed']}")
