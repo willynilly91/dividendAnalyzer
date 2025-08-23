@@ -1,12 +1,288 @@
-- name: Run conductor
-  run: python conductor.py
+#!/usr/bin/env python3
+"""
+history_updater.py
 
-# Commit & push regardless of success/failure above
-- name: Commit & push scraped CSVs
-  if: always()
-  run: |
-    git config user.name "github-actions[bot]"
-    git config user.email "github-actions[bot]@users.noreply.github.com"
-    git add -f historical_etf_yields_*.csv || true
-    git commit -m "conductor: checkpoint scraped history [${{ job.status }}]" || echo "Nothing to commit"
-    git push || true
+Rate-limit-aware history bootstrapper/updater.
+Writes to CSV after each successful ticker. No git operations here.
+
+Compatible with conductor.py & plotter:
+    ensure_history(
+        tickers: list[str],
+        csv_path: str | os.PathLike,
+        per_ticker_sleep: float = 1.5,
+        base_backoff: float = 4.0,
+        backoff_factor: float = 1.8,
+        max_backoff: float = 180.0,
+        max_retries: int = 8,
+        retention_days: int | None = None,
+        grace_days_incremental: int | None = None,
+        chunk_size_backfill: int | None = None,
+        **kwargs,   # ignore unknown future knobs
+    )
+"""
+
+from __future__ import annotations
+from pathlib import Path
+from typing import Iterable, List
+import math
+import random
+import time
+import datetime as dt
+
+import pandas as pd
+
+# --------- Symbol helpers ----------
+CA_SUFFIXES_DOT  = (".TO", ".NE", ".V", ".CN")
+CA_SUFFIXES_DASH = ("-TO", "-NE", "-V", "-CN")
+
+def _infer_currency(sym: str) -> str:
+    s = (sym or "").upper()
+    return "CAD" if s.endswith(CA_SUFFIXES_DOT) or s.endswith(CA_SUFFIXES_DASH) else "USD"
+
+def _normalize_symbol_for_yahoo(sym: str) -> str:
+    s = (sym or "").upper().strip()
+    for dash, dot in zip(CA_SUFFIXES_DASH, CA_SUFFIXES_DOT):
+        if s.endswith(dash):
+            return s[: -len(dash)] + dot
+    return s
+
+# --------- yfinance (lazy import) ----------
+def _lazy_import_yf():
+    import yfinance as yf
+    return yf
+
+# --------- Rate limiting ----------
+class RateLimiter:
+    def __init__(self, per_ticker_sleep: float = 1.5, base_backoff: float = 4.0,
+                 backoff_factor: float = 1.8, max_backoff: float = 180.0, max_retries: int = 8):
+        self.per_ticker_sleep = per_ticker_sleep
+        self.base_backoff = base_backoff
+        self.backoff_factor = backoff_factor
+        self.max_backoff = max_backoff
+        self.max_retries = max_retries
+
+    def nap_between_tickers(self):
+        time.sleep(self.per_ticker_sleep + random.uniform(0.0, 0.6))
+
+    def nap_between_chunks(self, seconds: float):
+        time.sleep(float(seconds) + random.uniform(0.0, 1.0))
+
+    def backoff_sleep(self, attempt: int):
+        delay = min(self.base_backoff * (self.backoff_factor ** (attempt - 1)), self.max_backoff)
+        jitter = random.uniform(0.0, min(2.5, delay * 0.25))
+        time.sleep(delay + jitter)
+
+def _retrying(fn, rl: RateLimiter, what: str):
+    _ = _lazy_import_yf()
+    for attempt in range(1, rl.max_retries + 1):
+        try:
+            return fn()
+        except Exception as e:
+            msg = str(e)
+            retryable = (
+                "YFRateLimitError" in e.__class__.__name__
+                or "Too Many Requests" in msg
+                or "Rate limited" in msg
+                or "HTTP Error 429" in msg
+                or "timed out" in msg.lower()
+                or "temporarily-unavailable" in msg.lower()
+                or "502" in msg or "503" in msg or "504" in msg
+            )
+            if attempt >= rl.max_retries or not retryable:
+                print(f"[ERROR] {what}: giving up after {attempt} attempt(s): {e}")
+                raise
+            print(f"[WARN] {what}: transient or rate-limit (attempt {attempt}/{rl.max_retries}). Backing off…")
+            rl.backoff_sleep(attempt)
+    raise RuntimeError("unreachable")
+
+# --------- CSV IO / UPSERT / PRUNE ----------
+def _read_csv(csv_path: Path) -> pd.DataFrame:
+    if not csv_path.exists():
+        return pd.DataFrame(columns=[
+            "Ticker","Ex-Div Date","Dividend","Price on Ex-Date","Currency","Scraped At Date"
+        ])
+    df = pd.read_csv(csv_path)
+    if "Ex-Div Date" in df.columns:
+        df["Ex-Div Date"] = pd.to_datetime(df["Ex-Div Date"], errors="coerce")
+    if "Scraped At Date" in df.columns:
+        df["Scraped At Date"] = pd.to_datetime(df["Scraped At Date"], errors="coerce")
+    return df
+
+def _upsert(existing: pd.DataFrame, new_rows: pd.DataFrame) -> pd.DataFrame:
+    if new_rows is None or new_rows.empty:
+        return existing
+    key = ["Ticker", "Ex-Div Date"]
+    new_rows = new_rows.drop_duplicates(subset=key, keep="last")
+    if existing.empty:
+        merged = new_rows
+    else:
+        ex_keys = set(tuple(x) for x in new_rows[key].itertuples(index=False, name=None))
+        existing = existing[~existing[key].apply(tuple, axis=1).isin(ex_keys)]
+        merged = pd.concat([existing, new_rows], ignore_index=True)
+    merged["Ex-Div Date"] = pd.to_datetime(merged["Ex-Div Date"], errors="coerce")
+    for c in ["Dividend", "Price on Ex-Date"]:
+        if c in merged.columns:
+            merged[c] = pd.to_numeric(merged[c], errors="coerce")
+    if "Scraped At Date" in merged.columns:
+        merged["Scraped At Date"] = pd.to_datetime(merged["Scraped At Date"], errors="coerce").dt.normalize()
+    return merged.sort_values(key).reset_index(drop=True)
+
+def _prune_retention(existing: pd.DataFrame, retention_days: int | None, grace_days: int | None) -> pd.DataFrame:
+    if not retention_days or retention_days <= 0 or existing.empty:
+        return existing
+    extra = max(0, int(grace_days or 0))
+    window = int(retention_days) + extra
+    cutoff = pd.Timestamp(dt.datetime.utcnow().date() - dt.timedelta(days=window))
+    kept = existing[existing["Ex-Div Date"] >= cutoff].copy()
+    return kept.reset_index(drop=True)
+
+# --------- Fetching ----------
+def _fetch_divs_and_prices(ticker: str, rl: RateLimiter) -> pd.DataFrame:
+    """
+    Returns columns:
+      Ticker, Ex-Div Date, Dividend, Price on Ex-Date, Currency, Scraped At Date
+    """
+    yf = _lazy_import_yf()
+    sym = _normalize_symbol_for_yahoo(ticker)
+    what = f"{sym}"
+
+    def _get_divs():
+        return yf.Ticker(sym).dividends
+
+    divs = _retrying(_get_divs, rl=rl, what=f"dividends {what}")
+    if divs is None or len(divs) == 0:
+        return pd.DataFrame(columns=["Ticker","Ex-Div Date","Dividend","Price on Ex-Date","Currency","Scraped At Date"])
+
+    ex_dates = pd.to_datetime(divs.index, utc=True).tz_convert(None).date
+    df = pd.DataFrame({
+        "Ticker": [sym] * len(divs),
+        "Ex-Div Date": pd.to_datetime(ex_dates),
+        "Dividend": pd.to_numeric(divs.values, errors="coerce"),
+    })
+
+    start = (df["Ex-Div Date"].min() - pd.Timedelta(days=7)).strftime("%Y-%m-%d")
+    end   = (df["Ex-Div Date"].max() + pd.Timedelta(days=7)).strftime("%Y-%m-%d")
+
+    def _get_hist():
+        return yf.Ticker(sym).history(start=start, end=end, auto_adjust=False, actions=False, interval="1d", timeout=60)
+
+    hist = _retrying(_get_hist, rl=rl, what=f"prices {what}")
+    closes = pd.Series(dtype=float)
+    if isinstance(hist, pd.DataFrame) and not hist.empty and "Close" in hist.columns:
+        c = hist["Close"].copy()
+        c.index = pd.to_datetime(c.index).tz_localize(None).date
+        closes = pd.Series(c.values, index=pd.to_datetime(list(c.index)))
+
+    # Map ex-date price, fallback up to 5 prior business days
+    prices = []
+    for d in df["Ex-Div Date"]:
+        px = None
+        try:
+            px = float(closes.get(d))
+        except Exception:
+            px = None
+        if (px is None) or (not math.isfinite(px)):
+            for k in range(1, 6):
+                dd = (pd.to_datetime(d) - pd.Timedelta(days=k)).to_pydatetime().date()
+                v = closes.get(dd)
+                if v is not None and math.isfinite(float(v)):
+                    px = float(v); break
+        prices.append(px if px is not None else float("nan"))
+
+    df["Price on Ex-Date"] = pd.to_numeric(pd.Series(prices), errors="coerce")
+    df["Currency"] = _infer_currency(sym)
+    df["Scraped At Date"] = pd.to_datetime(dt.datetime.utcnow().date())
+    df = df.dropna(subset=["Ex-Div Date", "Dividend"]).sort_values(["Ticker","Ex-Div Date"]).reset_index(drop=True)
+    return df
+
+# --------- Public API ----------
+def ensure_history(
+    tickers: Iterable[str],
+    csv_path: str | os.PathLike,
+    per_ticker_sleep: float = 1.5,
+    base_backoff: float = 4.0,
+    backoff_factor: float = 1.8,
+    max_backoff: float = 180.0,
+    max_retries: int = 8,
+    retention_days: int | None = None,
+    grace_days_incremental: int | None = None,
+    chunk_size_backfill: int | None = None,
+    **kwargs,  # ← ignore unknown args from conductor.py
+) -> None:
+    """
+    Writes CSV after each ticker (upsert). No git here.
+    If retention_days is provided, keeps only the last (retention_days + grace_days_incremental) days.
+    If chunk_size_backfill is provided (>0), process in small chunks with a rest between chunks.
+    """
+    csvp = Path(csv_path)
+    csvp.parent.mkdir(parents=True, exist_ok=True)
+
+    rl = RateLimiter(
+        per_ticker_sleep=per_ticker_sleep,
+        base_backoff=base_backoff,
+        backoff_factor=backoff_factor,
+        max_backoff=max_backoff,
+        max_retries=max_retries,
+    )
+
+    existing = _read_csv(csvp)
+
+    # chunking config
+    chunk_n = int(chunk_size_backfill or 0)
+    rest_between_chunks = max(8.0, rl.base_backoff * 2) if chunk_n > 0 else 0.0
+
+    def _process_batch(batch: List[str]):
+        nonlocal existing
+        total = ok = skipped = failed = 0
+        for raw in batch:
+            sym = (raw or "").strip()
+            if not sym:
+                continue
+            total += 1
+            print(f"[INFO] Scraping {sym} into {csvp.name} ...")
+            try:
+                df_new = _fetch_divs_and_prices(sym, rl=rl)
+                if df_new.empty:
+                    print(f"[WARN] {sym}: no dividend data found (skipping).")
+                    skipped += 1
+                else:
+                    norm = _normalize_symbol_for_yahoo(sym)
+                    df_new = df_new[df_new["Ticker"].astype(str) == norm]
+                    if df_new.empty:
+                        print(f"[WARN] {sym}: normalized symbol has no rows (skipping).")
+                        skipped += 1
+                    else:
+                        existing = _upsert(existing, df_new)
+                        if retention_days:
+                            existing = _prune_retention(existing, retention_days, grace_days_incremental)
+                            window = int(retention_days) + int(grace_days_incremental or 0)
+                            print(f"[INFO] Pruned {csvp.name} to last {window} days; rows={len(existing)}")
+                        # WRITE AFTER EACH TICKER (checkpoint on disk)
+                        existing.to_csv(csvp, index=False)
+                        ok += 1
+                        print(f"[OK] {norm}: wrote/updated {len(df_new)} row(s).")
+            except Exception as e:
+                failed += 1
+                print(f"[ERROR] {sym}: {e}")
+
+            rl.nap_between_tickers()
+
+        return total, ok, skipped, failed
+
+    tickers_list = [t for t in (tickers or []) if (t or "").strip()]
+    grand = dict(total=0, ok=0, skipped=0, failed=0)
+
+    if chunk_n > 0:
+        for i in range(0, len(tickers_list), chunk_n):
+            batch = tickers_list[i:i+chunk_n]
+            print(f"[INFO] Processing batch {i//chunk_n + 1} of {math.ceil(len(tickers_list)/chunk_n)} (size={len(batch)})")
+            t, o, s, f = _process_batch(batch)
+            grand["total"] += t; grand["ok"] += o; grand["skipped"] += s; grand["failed"] += f
+            if i + chunk_n < len(tickers_list):
+                print(f"[INFO] Resting {int(rest_between_chunks)}s between batches to avoid rate limits…")
+                rl.nap_between_chunks(rest_between_chunks)
+    else:
+        t, o, s, f = _process_batch(tickers_list)
+        grand["total"] += t; grand["ok"] += o; grand["skipped"] += s; grand["failed"] += f
+
+    print(f"[SUMMARY] total={grand['total']} ok={grand['ok']} skipped={grand['skipped']} failed={grand['failed']}")
