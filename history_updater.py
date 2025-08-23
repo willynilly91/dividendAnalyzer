@@ -2,9 +2,9 @@
 """
 history_updater.py
 
-Robust, rate-limit-aware history bootstrapper/updater used by plot_ticker_graph.py and conductor.py.
+Robust, rate-limit-aware history bootstrapper/updater.
 
-Public API (backwards compatible with your conductor):
+Public API (compatible with your conductor.py and plotter):
     ensure_history(
         tickers: list[str],
         csv_path: str | os.PathLike,
@@ -14,18 +14,18 @@ Public API (backwards compatible with your conductor):
         max_backoff: float = 180.0,
         max_retries: int = 8,
         commit_each: bool = True,
-        retention_days: int | None = None,   # ← NEW: optional pruning window
+        retention_days: int | None = None,
+        grace_days_incremental: int | None = None,   # NEW: extra days appended to retention window
     )
 
 Behavior:
   - For each ticker:
-      * Fetch dividends via yfinance (with retries, exponential backoff, jitter).
-      * Fetch daily closes around ex-dates for "Price on Ex-Date".
-      * Build rows and UPSERT into the target CSV by key (Ticker, Ex-Div Date).
-      * If retention_days is set, prune CSV to that rolling window.
-      * Write CSV immediately and GIT COMMIT after each successful ticker (checkpoint).
-  - Global throttling between tickers to be gentle on Yahoo.
-  - If a ticker yields no data, it's skipped without failing the whole run.
+      * Fetch dividends via yfinance (with retries + exponential backoff + jitter).
+      * Fetch daily closes around ex-dates to fill "Price on Ex-Date".
+      * Upsert rows into target CSV by key (Ticker, Ex-Div Date).
+      * If retention is configured, prune to last (retention_days + grace_days_incremental) days.
+      * Write CSV immediately and git commit after each ticker (checkpoint).
+  - Global throttling between tickers.
 """
 
 from __future__ import annotations
@@ -94,7 +94,7 @@ class RateLimiter:
         time.sleep(delay + jitter)
 
 def _retrying(fn, rl: RateLimiter, what: str):
-    yf = _lazy_import_yf()
+    _ = _lazy_import_yf()  # ensure import; keep signature same
     for attempt in range(1, rl.max_retries + 1):
         try:
             return fn()
@@ -149,10 +149,12 @@ def _upsert(existing: pd.DataFrame, new_rows: pd.DataFrame) -> pd.DataFrame:
         merged["Scraped At Date"] = pd.to_datetime(merged["Scraped At Date"], errors="coerce").dt.normalize()
     return merged.sort_values(key).reset_index(drop=True)
 
-def _prune_retention(existing: pd.DataFrame, retention_days: int | None) -> pd.DataFrame:
+def _prune_retention(existing: pd.DataFrame, retention_days: int | None, grace_days: int | None) -> pd.DataFrame:
     if not retention_days or retention_days <= 0 or existing.empty:
         return existing
-    cutoff = pd.Timestamp(dt.datetime.utcnow().date() - dt.timedelta(days=int(retention_days)))
+    extra = max(0, int(grace_days or 0))
+    window = int(retention_days) + extra
+    cutoff = pd.Timestamp(dt.datetime.utcnow().date() - dt.timedelta(days=window))
     kept = existing[existing["Ex-Div Date"] >= cutoff].copy()
     return kept.reset_index(drop=True)
 
@@ -181,7 +183,7 @@ def _fetch_divs_and_prices(ticker: str, rl: RateLimiter) -> pd.DataFrame:
         "Dividend": pd.to_numeric(divs.values, errors="coerce"),
     })
 
-    # Price window
+    # Price window around ex-dates
     start = (df["Ex-Div Date"].min() - pd.Timedelta(days=7)).strftime("%Y-%m-%d")
     end   = (df["Ex-Div Date"].max() + pd.Timedelta(days=7)).strftime("%Y-%m-%d")
 
@@ -195,7 +197,7 @@ def _fetch_divs_and_prices(ticker: str, rl: RateLimiter) -> pd.DataFrame:
         c.index = pd.to_datetime(c.index).tz_localize(None).date
         closes = pd.Series(c.values, index=pd.to_datetime(list(c.index)))
 
-    # Map ex-date price (fallback to up to 5 prior business days if exact missing)
+    # Map ex-date price (fallback to ≤5 prior business days if exact missing)
     prices = []
     for d in df["Ex-Div Date"]:
         px = None
@@ -228,10 +230,11 @@ def ensure_history(
     max_retries: int = 8,
     commit_each: bool = True,
     retention_days: int | None = None,
+    grace_days_incremental: int | None = None,
 ) -> None:
     """
-    Ensure history rows exist for each ticker in `csv_path`. Writes & (optionally) commits after each ticker.
-    If retention_days is provided, keeps only the last N days (by Ex-Div Date).
+    Ensure history rows exist for each ticker in `csv_path`. Writes & commits after each ticker.
+    If retention_days is provided, keeps only the last (retention_days + grace_days_incremental) days.
     """
     csvp = Path(csv_path)
     csvp.parent.mkdir(parents=True, exist_ok=True)
@@ -267,12 +270,16 @@ def ensure_history(
                 else:
                     existing = _upsert(existing, df_new)
                     if retention_days:
-                        existing = _prune_retention(existing, retention_days)
-                        print(f"[INFO] Pruned {csvp.name} to last {retention_days} days; rows={len(existing)}")
+                        existing = _prune_retention(existing, retention_days, grace_days_incremental)
+                        print(f"[INFO] Pruned {csvp.name} to last {int(retention_days) + int(grace_days_incremental or 0)} days; rows={len(existing)}")
                     existing.to_csv(csvp, index=False)
                     ok += 1
                     if commit_each:
-                        _git_commit([csvp], f"history_updater: upsert {norm} ({len(df_new)} rows){' + prune' if retention_days else ''}")
+                        _git_commit(
+                            [csvp],
+                            f"history_updater: upsert {norm} ({len(df_new)} rows)"
+                            + (f" + prune({int(retention_days) + int(grace_days_incremental or 0)}d)" if retention_days else "")
+                        )
                     print(f"[OK] {norm}: wrote/updated {len(df_new)} row(s).")
         except Exception as e:
             failed += 1
